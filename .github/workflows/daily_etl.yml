@@ -1,0 +1,31 @@
+name: Daily Real Estate ETL Pipeline
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-database:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Dependencies
+      run: |
+        pip install oracledb requests
+
+    - name: Run ETL Script
+      env:
+        RENTCAST_API_KEY: ${{ secrets.RENTCAST_API_KEY }}
+        ORACLE_ADMIN_PASSWORD: ${{ secrets.ORACLE_ADMIN_PASSWORD }}
+        ORACLE_WALLET_PASSWORD: ${{ secrets.ORACLE_WALLET_PASSWORD }}
+      run: |
+        python etl_realestate.py

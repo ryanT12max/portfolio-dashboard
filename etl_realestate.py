@@ -25,6 +25,14 @@ headers = {
 
 print("Extracting live Multi-Family listings in Houston...")
 response = requests.get(url, headers=headers, params=params)
+
+# --- NEW: Defensive Error Handling ---
+if response.status_code != 200:
+    print(f"API Error! Code: {response.status_code}")
+    print(f"Message: {response.text}")
+    print("Please check your API key and try again.")
+    exit() # Stops the script gracefully
+
 listings = response.json()
 
 # --- 2. TRANSFORM: Clean and map the JSON data to our SQL schema ---
@@ -42,6 +50,8 @@ for prop in listings:
     state = prop.get('state', 'TX')
     zip_code = prop.get('zipCode', '00000')
     prop_type = "Duplex" if prop.get('propertyType') == "Multi-Family" else prop.get('propertyType')
+    lat = prop.get('latitude', None)
+    lon = prop.get('longitude', None)
     
     lot_size = prop.get('lotSize', 0)
     structure_sqft = prop.get('squareFootage', 0)
@@ -55,7 +65,7 @@ for prop in listings:
     # If the API doesn't provide an exact rent estimate, we use the investor's "1% Rule" as a baseline
     est_rent = asking_price * 0.01 if asking_price else 0
     
-    properties_data.append((parcel_id, address, city, state, zip_code, prop_type))
+    properties_data.append((parcel_id, address, city, state, zip_code, prop_type, lat, lon))
     lot_data.append((parcel_id, lot_size, structure_sqft, year_built, has_restrictions))
     market_data.append((f"LST-{parcel_id}", parcel_id, today, asking_price, 'Active', est_rent))
 
@@ -74,11 +84,13 @@ print("Loading data into Oracle using MERGE statements...")
 # MERGE Properties: Insert if new, skip if exists
 cursor.executemany("""
     MERGE INTO Properties p
-    USING (SELECT :1 AS Parcel_ID, :2 AS Street_Address, :3 AS City, :4 AS State, :5 AS Zip_Code, :6 AS Property_Type FROM dual) src
+    USING (SELECT :1 AS Parcel_ID, :2 AS Street_Address, :3 AS City, :4 AS State, :5 AS Zip_Code, :6 AS Property_Type, :7 AS Latitude, :8 AS Longitude FROM dual) src
     ON (p.Parcel_ID = src.Parcel_ID)
+    WHEN MATCHED THEN
+        UPDATE SET Latitude = src.Latitude, Longitude = src.Longitude
     WHEN NOT MATCHED THEN
-        INSERT (Parcel_ID, Street_Address, City, State, Zip_Code, Property_Type)
-        VALUES (src.Parcel_ID, src.Street_Address, src.City, src.State, src.Zip_Code, src.Property_Type)
+        INSERT (Parcel_ID, Street_Address, City, State, Zip_Code, Property_Type, Latitude, Longitude)
+        VALUES (src.Parcel_ID, src.Street_Address, src.City, src.State, src.Zip_Code, src.Property_Type, src.Latitude, src.Longitude)
 """, properties_data)
 
 # MERGE Lot Characteristics: Update size/year if it changed, insert if new

@@ -5,6 +5,7 @@ import time
 import oracledb
 import yfinance as yf
 import datetime
+import plotly.express as px
 
 st.set_page_config(layout="wide", page_title="Live Sector Screener")
 st.title("Live Sector Screener Dashboard")
@@ -346,12 +347,13 @@ real_estate_query = """
         p.Street_Address,
         p.City,
         p.Property_Type,
+        p.Latitude AS "latitude",
+        p.Longitude AS "longitude",
         l.Lot_Size_SqFt,
         l.Year_Built,
         l.Has_Deed_Restrictions,
         m.Asking_Price,
         m.Est_Monthly_Rent,
-        -- Calculate Annual Gross Yield directly in SQL
         ROUND(((m.Est_Monthly_Rent * 12) / NULLIF(m.Asking_Price, 0)) * 100, 2) AS Gross_Yield_Pct
     FROM Properties p
     JOIN Lot_Characteristics l ON p.Parcel_ID = l.Parcel_ID
@@ -368,9 +370,9 @@ try:
     if df_real_estate.empty:
         st.info("The database tables are currently empty. Run an insert script to load properties!")
     else:
-        # Streamlit allows us to format the Pandas dataframe columns beautifully
+        # 1. Display the table
         st.dataframe(
-            df_real_estate.style.format({
+            df_real_estate.drop(columns=['latitude', 'longitude']).style.format({
                 'ASKING_PRICE': '${:,.0f}',
                 'EST_MONTHLY_RENT': '${:,.0f}',
                 'GROSS_YIELD_PCT': '{:.2f}%',
@@ -378,5 +380,85 @@ try:
             }),
             hide_index=True
         )
+        
+        # 2. Display the map safely
+        st.subheader("📍 Property Map")
+        
+        # Use Pandas to drop properties missing coordinates just for the map
+        df_map = df_real_estate.dropna(subset=['latitude', 'longitude'])
+        
+        if not df_map.empty:
+# Create an interactive Plotly map
+            fig = px.scatter_map(
+                df_map,
+                lat="latitude",
+                lon="longitude",
+                hover_name="STREET_ADDRESS",
+                hover_data={
+                    "latitude": False,
+                    "longitude": False,
+                    "ASKING_PRICE": True,
+                    "GROSS_YIELD_PCT": True
+                },
+                color="GROSS_YIELD_PCT",
+                color_continuous_scale="Viridis",
+                center={"lat": 29.7604, "lon": -95.3698},
+                zoom=9,
+                height=500
+            )
+            
+            # --- NEW: Make the dots much larger! ---
+            fig.update_traces(marker_size=15)
+            
+            fig.update_layout(map_style="open-street-map", margin={"r":0,"t":0,"l":0,"b":0})
+            st.plotly_chart(fig, use_container_width=True)
+
+            # --- INTERACTIVE MORTGAGE ESTIMATOR ---
+            st.divider()
+            st.subheader("💰 Interactive Mortgage Estimator")
+
+            col1, col2 = st.columns([1, 1.5])
+
+            with col1:
+                selected_address = st.selectbox(
+                    "Select a Property:", 
+                    df_map['STREET_ADDRESS'].tolist()
+                )
+                
+                property_price = float(df_map[df_map['STREET_ADDRESS'] == selected_address]['ASKING_PRICE'].values[0])
+                est_rent = float(df_map[df_map['STREET_ADDRESS'] == selected_address]['EST_MONTHLY_RENT'].values[0])
+                
+                down_payment_pct = st.slider("Down Payment (%)", min_value=0, max_value=100, value=20, step=5)
+                interest_rate = st.number_input("Annual Interest Rate (%)", min_value=1.0, max_value=15.0, value=6.5, step=0.1)
+                loan_term = st.selectbox("Loan Term (Years)", [15, 20, 30], index=2)
+
+            with col2:
+                down_payment_amount = property_price * (down_payment_pct / 100)
+                principal = property_price - down_payment_amount
+                
+                r = (interest_rate / 100) / 12
+                n = loan_term * 12
+                
+                if principal > 0 and r > 0:
+                    monthly_mortgage = principal * (r * (1 + r)**n) / ((1 + r)**n - 1)
+                else:
+                    monthly_mortgage = 0
+                
+                est_cash_flow = est_rent - monthly_mortgage
+
+                st.write("### Property Financials")
+                st.write(f"**Asking Price:** ${property_price:,.0f} | **Principal Loan:** ${principal:,.0f}")
+                
+                metric_col1, metric_col2 = st.columns(2)
+                metric_col1.metric(label="Est. Monthly Payment (P&I)", value=f"${monthly_mortgage:,.0f}")
+                metric_col2.metric(
+                    label="Est. Monthly Cash Flow", 
+                    value=f"${est_cash_flow:,.0f}",
+                    delta=f"${est_cash_flow:,.0f}",
+                    delta_color="normal"
+                )
+        else:
+            st.warning("Map Data Missing: Run python etl_realestate.py to backfill the geographic coordinates!")
+
 except Exception as e:
     st.error(f"Error loading real estate data: {e}")

@@ -214,8 +214,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Streamlit
+# Streamlit local secrets
 .streamlit/secrets.toml
 
-# Ignore Oracle Database credentials
-wallet/.env
+# Oracle Autonomous Database wallet files
+wallet/
+Wallet*/
+*.sso
+*.p12

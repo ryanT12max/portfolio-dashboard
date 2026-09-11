@@ -1,18 +1,43 @@
+import os
+import datetime
+import time
+
 import streamlit as st
 import pandas as pd
 import requests
-import time
 import oracledb
 import yfinance as yf
-import datetime
 import plotly.express as px
+from dotenv import load_dotenv
+
+
+# Load local development secrets from .env. In GitHub Codespaces, existing
+# environment variables (including Codespaces secrets) take precedence.
+load_dotenv()
+
+
+def required_env(name: str) -> str:
+    """Return a required environment variable without ever hard-coding secrets."""
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable: {name}. "
+            "Add it to your local .env file or Codespaces secrets."
+        )
+    return value
 
 st.set_page_config(layout="wide", page_title="Live Sector Screener")
 st.title("Live Sector Screener Dashboard")
 
 # --- API CONFIGURATION ---
 st.sidebar.header("API Settings")
-api_key = st.sidebar.text_input("Enter Finnhub API Key:", type="password")
+api_key = os.getenv("FINNHUB_API_KEY")
+
+if api_key:
+    st.sidebar.success("Finnhub API key loaded from secure configuration.")
+else:
+    st.sidebar.warning("Add FINNHUB_API_KEY to .env or GitHub Codespaces secrets.")
+    st.stop()
 
 # Predefine a list of tickers to query (Keep under 60 total to avoid rate limits)
 TICKERS = {
@@ -94,26 +119,27 @@ def fetch_stock_insights(ticker_symbol, key):
         
     return info, news_data
 
-if not api_key:
-    st.warning("Please enter your Finnhub API Key in the sidebar to load data.")
-    st.stop()
-
 with st.spinner("Fetching live market data..."):
     df = fetch_live_data(api_key)
 
 # --- FETCH PERSONAL PORTFOLIO ---
 @st.cache_resource
 def init_oracle():
+    """Create one cached Oracle connection using environment-managed secrets."""
     return oracledb.connect(
-        user="ADMIN",
-        password="pi11zNcpv$!db",
-        dsn="marketdevdb_high",
-        config_dir="wallet",
-        wallet_location="wallet",
-        wallet_password="rennJenn5011"
+        user=required_env("DB_USER"),
+        password=required_env("DB_PASSWORD"),
+        dsn=required_env("DB_DSN"),
     )
 
-conn = init_oracle()
+try:
+    conn = init_oracle()
+except (oracledb.Error, RuntimeError):
+    st.error(
+        "Unable to connect to Oracle. Check DB_USER, DB_PASSWORD, and DB_DSN "
+        "in .env, then restart Streamlit."
+    )
+    st.stop()
 
 # CTE to aggregate multiple buys/sells into a single row per Ticker
 portfolio_query = """
@@ -127,7 +153,14 @@ portfolio_query = """
     )
     SELECT * FROM PortfolioSummary WHERE Total_Shares > 0
 """
-df_portfolio = pd.read_sql(portfolio_query, con=conn)
+try:
+    df_portfolio = pd.read_sql(portfolio_query, con=conn)
+except Exception:
+    st.error(
+        "The portfolio tables could not be read. Confirm that PORTFOLIO_APP owns "
+        "or has SELECT access to PORTFOLIO_LEDGER before running the dashboard."
+    )
+    st.stop()
 
 # Merge on the Ticker column
 my_portfolio = pd.merge(df_portfolio, df, left_on='TICKER', right_on='TICKER', how='inner')
@@ -248,7 +281,7 @@ selected_trend_ticker = st.selectbox("Select a Stock to Analyze:", df['TICKER'].
 st.subheader(f"1-Year Trend for {selected_trend_ticker}")
 
 # 2. Update the CTE to calculate both 50-day and 200-day averages
-trend_query = f"""
+trend_query = """
     WITH MovingAverages AS (
         SELECT 
             Trade_Date,
@@ -256,14 +289,14 @@ trend_query = f"""
             AVG(Close_Price) OVER (ORDER BY Trade_Date ROWS 49 PRECEDING) as MA_50,
             AVG(Close_Price) OVER (ORDER BY Trade_Date ROWS 199 PRECEDING) as MA_200
         FROM Stock_History
-        WHERE Ticker = '{selected_trend_ticker}'
+        WHERE Ticker = :ticker
     )
     SELECT * FROM MovingAverages 
     ORDER BY Trade_Date ASC
 """
 
 try:
-    df_trends = pd.read_sql(trend_query, con=conn)
+    df_trends = pd.read_sql(trend_query, con=conn, params={"ticker": selected_trend_ticker})
     df_trends.set_index('TRADE_DATE', inplace=True)
     
     # 3. Streamlit will plot all three lines on the same graph

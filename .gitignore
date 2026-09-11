@@ -218,4 +218,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Ignore Oracle Database credentials
-wallet/
+wallet/.env

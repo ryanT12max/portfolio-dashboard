@@ -3,7 +3,7 @@ import oracledb
 # 1. Connect to Oracle
 conn = oracledb.connect(
     user="ADMIN",
-    password="pi11lzNcpv$!db",
+    password="pi11zNcpv$!db",
     dsn="marketdevdb_high",
     config_dir="wallet",
     wallet_location="wallet",

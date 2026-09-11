@@ -370,16 +370,26 @@ try:
     if df_real_estate.empty:
         st.info("The database tables are currently empty. Run an insert script to load properties!")
     else:
-        # 1. Display the table
-        st.dataframe(
+        # 1. Display the table with single-row selection enabled
+        event = st.dataframe(
             df_real_estate.drop(columns=['latitude', 'longitude']).style.format({
                 'ASKING_PRICE': '${:,.0f}',
                 'EST_MONTHLY_RENT': '${:,.0f}',
                 'GROSS_YIELD_PCT': '{:.2f}%',
                 'LOT_SIZE_SQFT': '{:,.0f}'
             }),
-            hide_index=True
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="real_estate_table"
         )
+        
+        # Extract the selected row index if a user clicks a property
+        selected_rows = event.selection.rows
+        selected_address = None
+        if selected_rows:
+            selected_idx = selected_rows[0]
+            selected_address = df_real_estate.iloc[selected_idx]['STREET_ADDRESS']
         
         # 2. Display the map safely
         st.subheader("📍 Property Map")
@@ -388,7 +398,21 @@ try:
         df_map = df_real_estate.dropna(subset=['latitude', 'longitude'])
         
         if not df_map.empty:
-# Create an interactive Plotly map
+            # Default view: Center of Houston
+            map_center = {"lat": 29.7604, "lon": -95.3698}
+            zoom_level = 9
+            
+            # If a row in the table is clicked, shift camera to that property!
+            if selected_address:
+                selected_prop = df_map[df_map['STREET_ADDRESS'] == selected_address]
+                if not selected_prop.empty:
+                    map_center = {
+                        "lat": float(selected_prop['latitude'].values[0]),
+                        "lon": float(selected_prop['longitude'].values[0])
+                    }
+                    zoom_level = 14  # Zoom in close to street view
+
+            # Create an interactive Plotly map
             fig = px.scatter_map(
                 df_map,
                 lat="latitude",
@@ -402,13 +426,27 @@ try:
                 },
                 color="GROSS_YIELD_PCT",
                 color_continuous_scale="Viridis",
-                center={"lat": 29.7604, "lon": -95.3698},
-                zoom=9,
+                center=map_center,
+                zoom=zoom_level,
                 height=500
             )
             
-            # --- NEW: Make the dots much larger! ---
+            # Make standard dots larger
             fig.update_traces(marker_size=15)
+            
+            # Overlay a distinct red marker on the selected property if clicked
+            if selected_address:
+                selected_prop = df_map[df_map['STREET_ADDRESS'] == selected_address]
+                if not selected_prop.empty:
+                    import plotly.graph_objects as go
+                    fig.add_trace(go.Scattermap(
+                        lat=selected_prop['latitude'],
+                        lon=selected_prop['longitude'],
+                        mode='markers',
+                        marker=dict(size=26, color='red', symbol='circle'),
+                        name='Selected Property',
+                        hovertext=selected_prop['STREET_ADDRESS']
+                    ))
             
             fig.update_layout(map_style="open-street-map", margin={"r":0,"t":0,"l":0,"b":0})
             st.plotly_chart(fig, use_container_width=True)
@@ -420,13 +458,19 @@ try:
             col1, col2 = st.columns([1, 1.5])
 
             with col1:
-                selected_address = st.selectbox(
+                # Sync the calculator selectbox with the table selection if possible
+                default_idx = 0
+                if selected_address and selected_address in df_map['STREET_ADDRESS'].tolist():
+                    default_idx = df_map['STREET_ADDRESS'].tolist().index(selected_address)
+
+                selected_address_calc = st.selectbox(
                     "Select a Property:", 
-                    df_map['STREET_ADDRESS'].tolist()
+                    df_map['STREET_ADDRESS'].tolist(),
+                    index=default_idx
                 )
                 
-                property_price = float(df_map[df_map['STREET_ADDRESS'] == selected_address]['ASKING_PRICE'].values[0])
-                est_rent = float(df_map[df_map['STREET_ADDRESS'] == selected_address]['EST_MONTHLY_RENT'].values[0])
+                property_price = float(df_map[df_map['STREET_ADDRESS'] == selected_address_calc]['ASKING_PRICE'].values[0])
+                est_rent = float(df_map[df_map['STREET_ADDRESS'] == selected_address_calc]['EST_MONTHLY_RENT'].values[0])
                 
                 down_payment_pct = st.slider("Down Payment (%)", min_value=0, max_value=100, value=20, step=5)
                 interest_rate = st.number_input("Annual Interest Rate (%)", min_value=1.0, max_value=15.0, value=6.5, step=0.1)

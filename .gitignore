@@ -149,6 +149,8 @@ activemq-data/
 
 # Environments
 .env
+.env*
+!.env.example
 .envrc
 .venv
 env/
@@ -222,3 +224,5 @@ wallet/
 Wallet*/
 *.sso
 *.p12
+*.pem
+*.jks

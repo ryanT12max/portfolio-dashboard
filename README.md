@@ -121,8 +121,6 @@ The project pins direct production dependencies and keeps Pytest in requirements
 Next planned improvements
 Add a dedicated rental-estimate enrichment pipeline before treating yield as broadly available.
 
-Add GitHub Actions to run unit tests on each push and pull request.
-
 Add data-quality monitoring for rejected records, late ETL runs, and null-rate changes.
 
 Add a separate stock holdings model and stock pipeline once personal holdings exist.

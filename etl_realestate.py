@@ -9,21 +9,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import sys
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
 
 import oracledb
 import requests
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
-
-load_dotenv()
+from portfolio_dashboard.config import ConfigurationError, get_settings
+from portfolio_dashboard.database import get_connection
 
 SOURCE_NAME = "RENTCAST"
 RENTCAST_URL = "https://api.rentcast.io/v1/listings/sale"
@@ -72,25 +68,6 @@ class FetchMetrics:
     rejected_count: int
 
 
-def required_env(name: str) -> str:
-    """Read a required secret/configuration value without hard-coding it."""
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
-def max_listings() -> int:
-    """Limit API consumption; override locally with RENTCAST_MAX_LISTINGS."""
-    try:
-        value = int(os.getenv("RENTCAST_MAX_LISTINGS", "50"))
-    except ValueError as error:
-        raise RuntimeError("RENTCAST_MAX_LISTINGS must be a whole number.") from error
-    if not 1 <= value <= 5000:
-        raise RuntimeError("RENTCAST_MAX_LISTINGS must be between 1 and 5000.")
-    return value
-
-
 def build_http_session() -> requests.Session:
     retry = Retry(
         total=3,
@@ -107,8 +84,16 @@ def build_http_session() -> requests.Session:
 
 def fetch_and_validate_listings() -> tuple[list[PropertyListing], FetchMetrics]:
     """Fetch pages up to the configured cap and validate every returned row."""
-    api_key = required_env("RENTCAST_API_KEY")
-    record_cap = max_listings()
+    settings = get_settings()
+    api_key = settings.rentcast_api_key
+
+    if not api_key:
+        raise ConfigurationError(
+            "Missing required environment variable: RENTCAST_API_KEY. "
+            "Add it to your local .env file or Codespaces secrets."
+        )
+
+    record_cap = settings.rentcast_max_listings
     headers = {"accept": "application/json", "X-Api-Key": api_key}
     session = build_http_session()
 
@@ -369,11 +354,7 @@ def insert_listing_snapshot(
 
 def run_pipeline() -> int:
     """Audit, fetch, and load one complete run with atomic property/snapshot writes."""
-    connection = oracledb.connect(
-        user=required_env("DB_USER"),
-        password=required_env("DB_PASSWORD"),
-        dsn=required_env("DB_DSN"),
-    )
+    connection = get_connection()
     run_id: Optional[int] = None
     metrics = FetchMetrics(extracted_count=0, validated_count=0, rejected_count=0)
 

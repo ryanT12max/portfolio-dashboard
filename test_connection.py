@@ -1,29 +1,15 @@
-"""Verify that local environment configuration can connect to Oracle."""
+"""Verify that centralized configuration can connect to Oracle."""
 
-import os
+from __future__ import annotations
+
 import sys
 
-import oracledb
-from dotenv import load_dotenv
-
-
-load_dotenv()
-
-
-def required_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+from portfolio_dashboard.database import get_connection
 
 
 def main() -> None:
     try:
-        with oracledb.connect(
-            user=required_env("DB_USER"),
-            password=required_env("DB_PASSWORD"),
-            dsn=required_env("DB_DSN"),
-        ) as connection:
+        with get_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT SYS_CONTEXT('USERENV', 'CURRENT_USER') FROM dual"

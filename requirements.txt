@@ -1,7 +1,6 @@
-streamlit
-pandas
-plotly
-requests
-oracledb
-pydantic
-python-dotenv
+streamlit==1.63.0
+pandas==3.0.5
+requests==2.32.5
+oracledb==4.0.2
+pydantic==2.13.5
+python-dotenv==1.2.3

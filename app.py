@@ -1,6 +1,13 @@
-"""Dashboard for the canonical Houston real-estate investment-analysis view."""
+"""Streamlit dashboard for canonical real-estate and market-watchlist data.
+
+The dashboard reads only PORTFOLIO_APP reporting views. It surfaces data
+freshness and coverage limitations so historical or incomplete data is never
+presented as current investment advice.
+"""
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -9,9 +16,10 @@ from portfolio_dashboard.config import ConfigurationError
 from portfolio_dashboard.database import managed_connection
 
 
-CURRENT_ANALYSIS_SQL = """
+CURRENT_LISTINGS_SQL = """
     SELECT
         property_key,
+        source_property_id,
         street_address,
         city,
         state_code,
@@ -20,97 +28,176 @@ CURRENT_ANALYSIS_SQL = """
         bedrooms,
         bathrooms,
         structure_sqft,
+        lot_size_sqft,
+        year_built,
         latitude,
         longitude,
-        listing_observed_at,
+        observed_at,
+        listing_date,
+        last_seen_date,
         listing_status,
         asking_price,
-        rent_estimate_snapshot_id,
-        rent_estimate_observed_at,
-        estimated_monthly_rent,
-        rent_range_low,
-        rent_range_high,
-        comparable_count,
-        rent_estimate_status,
-        investment_analysis_status,
-        estimated_gross_yield_pct,
-        estimated_gross_yield_low_pct,
-        estimated_gross_yield_high_pct
-    FROM vw_re_current_investment_analysis
+        est_monthly_rent,
+        gross_yield_pct
+    FROM vw_re_current_listing
     WHERE listing_status = 'Active' OR listing_status IS NULL
-    ORDER BY listing_observed_at DESC, asking_price ASC
+    ORDER BY observed_at DESC, asking_price ASC
 """
 
-LATEST_LISTING_RUN_SQL = """
-    SELECT run_id, completed_at, run_status, loaded_count
+LATEST_REAL_ESTATE_RUN_SQL = """
+    SELECT
+        run_id,
+        started_at,
+        completed_at,
+        run_status,
+        extracted_count,
+        validated_count,
+        rejected_count,
+        loaded_count
     FROM re_etl_run
-    WHERE source_name = 'RENTCAST'
     ORDER BY run_id DESC
     FETCH FIRST 1 ROW ONLY
 """
 
-LATEST_RENT_RUN_SQL = """
-    SELECT run_id, completed_at, run_status, loaded_count
-    FROM re_etl_run
-    WHERE source_name = 'RENTCAST_RENT_AVM'
-    ORDER BY run_id DESC
-    FETCH FIRST 1 ROW ONLY
+MARKET_WATCHLIST_SQL = """
+    SELECT
+        security_key,
+        ticker,
+        sector,
+        latest_trade_date,
+        latest_close_price,
+        latest_volume,
+        latest_price_source,
+        latest_price_observed_at,
+        fundamental_snapshot_id,
+        fundamentals_source,
+        fundamentals_source_as_of_date,
+        fundamentals_observed_at,
+        fundamental_market_price,
+        pe_ratio,
+        peg_ratio,
+        pb_ratio,
+        earnings_per_share,
+        return_on_equity_pct,
+        profit_margin_pct,
+        debt_to_equity_ratio,
+        free_cash_flow_value,
+        free_cash_flow_unit,
+        price_history_status,
+        fundamentals_status
+    FROM vw_mk_watchlist_analysis
+    ORDER BY ticker
+"""
+
+MARKET_PRICE_HISTORY_SQL = """
+    SELECT
+        ticker,
+        trade_date,
+        close_price,
+        volume,
+        source_name,
+        observed_at
+    FROM vw_mk_price_history
+    WHERE ticker = :ticker
+    ORDER BY trade_date
 """
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_dashboard_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Read reporting data and separate audit records for the two pipelines."""
+def load_real_estate_dashboard_data() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load current listings and the latest real-estate ETL audit record."""
     with managed_connection() as connection:
-        listings = pd.read_sql_query(CURRENT_ANALYSIS_SQL, con=connection)
-        listing_run = pd.read_sql_query(LATEST_LISTING_RUN_SQL, con=connection)
-        rent_run = pd.read_sql_query(LATEST_RENT_RUN_SQL, con=connection)
+        listings = pd.read_sql_query(CURRENT_LISTINGS_SQL, con=connection)
+        latest_run = pd.read_sql_query(LATEST_REAL_ESTATE_RUN_SQL, con=connection)
 
-    for frame in (listings, listing_run, rent_run):
-        frame.columns = [column.lower() for column in frame.columns]
+    listings.columns = [column.lower() for column in listings.columns]
+    latest_run.columns = [column.lower() for column in latest_run.columns]
 
-    for column in ("listing_observed_at", "rent_estimate_observed_at"):
-        listings[column] = pd.to_datetime(listings[column], errors="coerce")
+    for column in ("observed_at", "listing_date", "last_seen_date"):
+        if column in listings:
+            listings[column] = pd.to_datetime(listings[column], errors="coerce")
 
-    for frame in (listing_run, rent_run):
-        if not frame.empty:
-            frame["completed_at"] = pd.to_datetime(
-                frame["completed_at"], errors="coerce"
-            )
+    return listings, latest_run
 
-    return listings, listing_run, rent_run
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_market_watchlist_data() -> pd.DataFrame:
+    """Load the canonical market-watchlist analysis view."""
+    with managed_connection() as connection:
+        watchlist = pd.read_sql_query(MARKET_WATCHLIST_SQL, con=connection)
+
+    watchlist.columns = [column.lower() for column in watchlist.columns]
+
+    for column in (
+        "latest_trade_date",
+        "latest_price_observed_at",
+        "fundamentals_source_as_of_date",
+        "fundamentals_observed_at",
+    ):
+        if column in watchlist:
+            watchlist[column] = pd.to_datetime(watchlist[column], errors="coerce")
+
+    return watchlist
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_market_price_history(ticker: str) -> pd.DataFrame:
+    """Load one security's canonical historical close-price series."""
+    with managed_connection() as connection:
+        history = pd.read_sql_query(
+            MARKET_PRICE_HISTORY_SQL,
+            con=connection,
+            params={"ticker": ticker},
+        )
+
+    history.columns = [column.lower() for column in history.columns]
+    if "trade_date" in history:
+        history["trade_date"] = pd.to_datetime(history["trade_date"], errors="coerce")
+    if "observed_at" in history:
+        history["observed_at"] = pd.to_datetime(history["observed_at"], errors="coerce")
+
+    return history
 
 
 def money(value: float | int | None) -> str:
-    """Format an optional value as whole dollars."""
+    """Format an optional numeric value as whole-dollar currency."""
     if value is None or pd.isna(value):
         return "—"
-    return "$" + f"{value:,.0f}"
+    return f"${value:,.0f}"
 
 
 def percent(value: float | int | None) -> str:
-    """Format an optional percentage."""
+    """Format an optional numeric value as a percentage."""
     if value is None or pd.isna(value):
         return "—"
     return f"{value:,.2f}%"
 
 
-def money_range(low: float | int | None, high: float | int | None) -> str:
-    """Format an optional dollar range."""
-    if low is None or high is None or pd.isna(low) or pd.isna(high):
+def decimal(value: float | int | None) -> str:
+    """Format an optional numeric value without implying a unit or currency."""
+    if value is None or pd.isna(value):
         return "—"
-    return f"{money(low)}–{money(high)}"
+    return f"{value:,.2f}"
 
 
-def percent_range(low: float | int | None, high: float | int | None) -> str:
-    """Format an optional percentage range."""
-    if low is None or high is None or pd.isna(low) or pd.isna(high):
+def timestamp_text(value: object) -> str:
+    """Format an optional pandas or Oracle date/timestamp for the dashboard."""
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
         return "—"
-    return f"{percent(low)}–{percent(high)}"
+    return timestamp.strftime("%Y-%m-%d")
+
+
+def market_price_age_days(latest_trade_date: object) -> int | None:
+    """Return calendar-day age for the most recent stored market price."""
+    timestamp = pd.to_datetime(latest_trade_date, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    return (datetime.now(timezone.utc).date() - timestamp.date()).days
 
 
 def mortgage_payment(principal: float, annual_rate_pct: float, term_years: int) -> float:
-    """Return fixed-rate monthly principal and interest."""
+    """Calculate the principal-and-interest payment for a fixed-rate loan."""
     if principal <= 0:
         return 0.0
 
@@ -125,37 +212,19 @@ def mortgage_payment(principal: float, annual_rate_pct: float, term_years: int) 
     ) / ((1 + monthly_rate) ** payment_count - 1)
 
 
-def run_caption(label: str, frame: pd.DataFrame, noun: str) -> str:
-    """Describe one ETL run without mislabeling it as the other pipeline."""
-    if frame.empty:
-        return f"{label}: no completed run is available yet."
-
-    run = frame.iloc[0]
-    completed = run["completed_at"]
-    completed_text = (
-        completed.strftime("%Y-%m-%d %H:%M UTC")
-        if pd.notna(completed)
-        else "not completed"
-    )
-    loaded = int(run["loaded_count"]) if pd.notna(run["loaded_count"]) else 0
-
-    return (
-        f"{label}: run #{int(run['run_id'])} • {run['run_status']} • "
-        f"{loaded:,} {noun} loaded • completed {completed_text}"
-    )
-
-
 def render_scenario_calculator(listings: pd.DataFrame) -> None:
-    """Show an editable, first-pass cash-flow scenario."""
+    """Render an assumption-driven underwriting scenario for one listing."""
     st.subheader("Investment Scenario Calculator")
     st.caption(
-        "Planning only—not an appraisal, lending quote, or investment recommendation."
+        "This is a planning tool, not an appraisal, lending quote, or investment recommendation."
     )
 
+    options = listings["property_key"].tolist()
     lookup = listings.set_index("property_key")
+
     selected_key = st.selectbox(
         "Choose a listing",
-        listings["property_key"].tolist(),
+        options,
         format_func=lambda key: (
             f"{lookup.loc[key, 'street_address']} "
             f"({money(lookup.loc[key, 'asking_price'])})"
@@ -163,27 +232,8 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
     )
     selected = lookup.loc[selected_key]
 
-    has_estimate = selected["rent_estimate_status"] == "ESTIMATED"
-    suggested_rent = selected["estimated_monthly_rent"]
+    suggested_rent = selected["est_monthly_rent"]
     rent_default = float(suggested_rent) if pd.notna(suggested_rent) else 0.0
-
-    if has_estimate:
-        comparable_count = (
-            int(selected["comparable_count"])
-            if pd.notna(selected["comparable_count"])
-            else 0
-        )
-        st.info(
-            "Provider rent estimate: "
-            f"{money(suggested_rent)} per month "
-            f"(range {money_range(selected['rent_range_low'], selected['rent_range_high'])}; "
-            f"{comparable_count} comparables). Review it before using it."
-        )
-    else:
-        st.warning(
-            "No provider rent estimate is available. Enter a researched manual "
-            "rent assumption; missing rent is never treated as zero."
-        )
 
     assumptions, results = st.columns(2)
 
@@ -200,7 +250,7 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
             min_value=0.0,
             value=rent_default,
             step=100.0,
-            help="Starts with the provider estimate when one is available.",
+            help="RentCast sale listings may not include an estimated rent. Enter your own assumption when needed.",
         )
         down_payment_pct = st.slider("Down payment (%)", 0, 100, 20, 5)
         interest_rate_pct = st.number_input(
@@ -214,6 +264,10 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
 
     with results:
         st.markdown("#### Scenario results")
+        down_payment = purchase_price * down_payment_pct / 100
+        principal = purchase_price - down_payment
+        monthly_pi = mortgage_payment(principal, interest_rate_pct, loan_term_years)
+
         property_tax_pct = st.number_input(
             "Property-tax assumption (%)",
             min_value=0.0,
@@ -227,194 +281,148 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
             value=2_400.0,
             step=100.0,
         )
-        monthly_hoa = st.number_input(
-            "Monthly HOA assumption",
-            min_value=0.0,
-            value=0.0,
-            step=25.0,
-        )
         maintenance_pct = st.slider("Maintenance reserve (% of rent)", 0, 30, 8, 1)
         vacancy_pct = st.slider("Vacancy reserve (% of rent)", 0, 30, 5, 1)
 
-        down_payment = purchase_price * down_payment_pct / 100
-        principal = purchase_price - down_payment
-        monthly_pi = mortgage_payment(principal, interest_rate_pct, loan_term_years)
         monthly_tax = purchase_price * property_tax_pct / 100 / 12
         monthly_insurance = annual_insurance / 12
         monthly_maintenance = monthly_rent * maintenance_pct / 100
         monthly_vacancy = monthly_rent * vacancy_pct / 100
-
         operating_costs = (
-            monthly_tax
-            + monthly_insurance
-            + monthly_hoa
-            + monthly_maintenance
-            + monthly_vacancy
+            monthly_tax + monthly_insurance + monthly_maintenance + monthly_vacancy
         )
-        monthly_cash_flow = monthly_rent - monthly_pi - operating_costs
+        estimated_cash_flow = monthly_rent - monthly_pi - operating_costs
+
         annual_noi = (monthly_rent - operating_costs) * 12
         cap_rate = annual_noi / purchase_price * 100 if purchase_price else None
 
-        left, right = st.columns(2)
-        left.metric("Down payment", money(down_payment))
-        right.metric("Principal and interest", money(monthly_pi))
-        left.metric("Monthly operating costs", money(operating_costs))
-        right.metric("Estimated monthly cash flow", money(monthly_cash_flow))
+        metric_left, metric_right = st.columns(2)
+        metric_left.metric("Down payment", money(down_payment))
+        metric_right.metric("Principal and interest", money(monthly_pi))
+        metric_left.metric("Monthly operating costs", money(operating_costs))
+        metric_right.metric("Estimated monthly cash flow", money(estimated_cash_flow))
         st.metric("Estimated cap rate", percent(cap_rate))
 
     if monthly_rent == 0:
-        st.info("Enter a monthly rent assumption to calculate cash flow and cap rate.")
+        st.info("Enter a monthly rent assumption to evaluate cash flow and cap rate.")
 
     st.caption(
-        "Operating costs include assumed tax, insurance, HOA, maintenance, and vacancy. "
-        "They exclude closing costs, utilities, management fees, capital expenditures, "
-        "income taxes, and major repairs."
+        "Operating costs shown include assumed tax, insurance, maintenance, and vacancy only. "
+        "They exclude closing costs, HOA fees, utilities, management fees, capital expenditures, and income taxes."
     )
 
 
-def main() -> None:
-    st.set_page_config(layout="wide", page_title="Houston Real Estate Dashboard")
-    st.title("Houston Real Estate Investment Dashboard")
+def render_real_estate_dashboard() -> None:
+    """Render the existing real-estate opportunity analysis section."""
+    st.header("Houston Real Estate Opportunities")
     st.caption(
-        "Current active listings and historical RentCast rent estimates, stored and "
-        "audited in Oracle Autonomous Database."
+        "Current active RentCast listings stored and audited in Oracle Autonomous Database."
     )
-
-    if st.sidebar.button("Refresh data"):
-        st.cache_data.clear()
-        st.rerun()
 
     try:
-        listings, listing_run, rent_run = load_dashboard_data()
-    except ConfigurationError as error:
-        st.error(f"Configuration error: {error}")
-        st.stop()
-    except Exception:
+        listings, latest_run = load_real_estate_dashboard_data()
+    except (ConfigurationError, Exception):
         st.error(
-            "Unable to load investment-analysis data. Confirm the canonical migrations "
-            "have run and that the database settings are valid."
+            "Unable to load real-estate data. Verify the database settings in .env "
+            "and confirm that the canonical real-estate migration has run."
         )
-        st.stop()
+        return
 
     if listings.empty:
-        st.info("No current listings are available. Run the real-estate ETL and refresh.")
-        st.stop()
-
-    st.sidebar.header("Listing filters")
+        st.info("No current listings are available yet. Run `python etl_realestate.py` and refresh.")
+        return
 
     property_types = sorted(listings["property_type"].dropna().unique().tolist())
-    selected_types = st.sidebar.multiselect(
-        "Property types",
-        options=property_types,
-        default=property_types,
-    )
+    filter_left, filter_right = st.columns(2)
 
-    labels = {
-        "ESTIMATED": "Rent estimate available",
-        "MISSING": "Needs rent estimate",
-    }
-    selected_statuses = st.sidebar.multiselect(
-        "Rent-estimate availability",
-        options=list(labels),
-        default=list(labels),
-        format_func=lambda status: labels[status],
-    )
+    with filter_left:
+        selected_types = st.multiselect(
+            "Property types",
+            options=property_types,
+            default=property_types,
+        )
 
     min_price = int(listings["asking_price"].min())
     max_price = int(listings["asking_price"].max())
-    price_range = st.sidebar.slider(
-        "Asking-price range",
-        min_value=min_price,
-        max_value=max_price,
-        value=(min_price, max_price),
-        step=5_000,
-    )
+    with filter_right:
+        if min_price == max_price:
+            selected_price_range = (min_price, max_price)
+            st.caption(f"All current listings have the same asking price: {money(min_price)}.")
+        else:
+            selected_price_range = st.slider(
+                "Asking-price range",
+                min_value=min_price,
+                max_value=max_price,
+                value=(min_price, max_price),
+                step=5_000,
+            )
 
     filtered = listings[
         listings["property_type"].isin(selected_types)
-        & listings["rent_estimate_status"].isin(selected_statuses)
-        & listings["asking_price"].between(*price_range)
+        & listings["asking_price"].between(*selected_price_range)
     ].copy()
     filtered = filtered.sort_values(
-        by=["estimated_gross_yield_pct", "asking_price"],
+        by=["gross_yield_pct", "asking_price"],
         ascending=[False, True],
         na_position="last",
     )
 
     if filtered.empty:
-        st.warning("No listings match the current filters. Adjust the sidebar filters.")
-        st.stop()
+        st.warning("No listings match the current filters. Adjust the filters above.")
+        return
 
-    estimate_count = int((filtered["rent_estimate_status"] == "ESTIMATED").sum())
-    coverage_pct = estimate_count / len(filtered) * 100
-    median_yield = filtered.loc[
-        filtered["rent_estimate_status"] == "ESTIMATED",
-        "estimated_gross_yield_pct",
-    ].median()
+    rent_coverage_count = int(filtered["est_monthly_rent"].notna().sum())
+    median_yield = filtered["gross_yield_pct"].median()
+    newest_observation = filtered["observed_at"].max()
 
     metric_1, metric_2, metric_3, metric_4 = st.columns(4)
     metric_1.metric("Listings shown", f"{len(filtered):,}")
     metric_2.metric("Median asking price", money(filtered["asking_price"].median()))
-    metric_3.metric("Rent-estimate coverage", percent(coverage_pct))
-    metric_4.metric("Median estimated gross yield", percent(median_yield))
+    metric_3.metric("Listings with rent estimate", f"{rent_coverage_count:,}")
+    metric_4.metric("Median gross yield", percent(median_yield))
 
-    st.caption(run_caption("Latest listing ETL", listing_run, "listings"))
-    st.caption(run_caption("Latest rent-estimate ETL", rent_run, "estimates"))
-
-    missing_count = len(filtered) - estimate_count
-    if missing_count:
-        st.info(
-            f"{missing_count:,} shown listing(s) still need a rent estimate. They remain "
-            "available for manual scenario analysis."
+    if not latest_run.empty:
+        run = latest_run.iloc[0]
+        completed = pd.to_datetime(run["completed_at"], errors="coerce")
+        completed_text = (
+            completed.strftime("%Y-%m-%d %H:%M UTC")
+            if pd.notna(completed)
+            else "not completed"
+        )
+        loaded_count = int(run["loaded_count"]) if pd.notna(run["loaded_count"]) else 0
+        st.caption(
+            f"Latest ETL run: #{int(run['run_id'])} • {run['run_status']} • "
+            f"{loaded_count} listings loaded • completed {completed_text}"
+        )
+    elif pd.notna(newest_observation):
+        st.caption(
+            f"Latest observed listing timestamp: {newest_observation:%Y-%m-%d %H:%M UTC}"
         )
 
-    with st.expander("How to interpret this dashboard"):
+    with st.expander("How to interpret these real-estate metrics"):
         st.markdown(
             """
-            - **Rent estimate available** means a validated RentCast long-term rent
-              estimate is stored for the property. It is not guaranteed income.
-            - **Needs rent estimate** means no estimate has been collected. Blank rent
-              and yield values mean *unknown*, not zero.
-            - **Estimated gross yield** is annual estimated rent divided by asking
-              price. It excludes taxes, insurance, HOA, maintenance, vacancy,
-              financing, and closing costs.
-            - **Rent and yield ranges** show the provider's lower and upper estimate
-              bounds. A wide range warrants more property-level research.
+            - **Asking price** is the seller's list price, not an appraisal or final sale price.
+            - **Gross yield** is `(estimated monthly rent × 12) ÷ asking price`. It excludes operating and financing costs.
+            - **Listings with rent estimate** identifies rows with source rent data. A blank rent is unknown, not zero.
+            - Use the scenario calculator for a first-pass underwriting exercise, then verify each assumption independently.
             """
         )
 
     st.subheader("Current listings")
-    table = filtered.assign(
-        rent_estimate_availability=filtered["rent_estimate_status"].map(labels),
-        rent_estimate_range=filtered.apply(
-            lambda row: money_range(row["rent_range_low"], row["rent_range_high"]),
-            axis=1,
-        ),
-        estimated_yield_range=filtered.apply(
-            lambda row: percent_range(
-                row["estimated_gross_yield_low_pct"],
-                row["estimated_gross_yield_high_pct"],
-            ),
-            axis=1,
-        ),
-    )[
-        [
-            "street_address",
-            "city",
-            "property_type",
-            "bedrooms",
-            "bathrooms",
-            "structure_sqft",
-            "asking_price",
-            "rent_estimate_availability",
-            "estimated_monthly_rent",
-            "rent_estimate_range",
-            "comparable_count",
-            "estimated_gross_yield_pct",
-            "estimated_yield_range",
-            "listing_observed_at",
-        ]
-    ].rename(
+    table_columns = [
+        "street_address",
+        "city",
+        "property_type",
+        "bedrooms",
+        "bathrooms",
+        "structure_sqft",
+        "asking_price",
+        "est_monthly_rent",
+        "gross_yield_pct",
+        "observed_at",
+    ]
+    table = filtered[table_columns].rename(
         columns={
             "street_address": "Address",
             "city": "City",
@@ -423,29 +431,21 @@ def main() -> None:
             "bathrooms": "Baths",
             "structure_sqft": "Square feet",
             "asking_price": "Asking price",
-            "rent_estimate_availability": "Rent estimate",
-            "estimated_monthly_rent": "Estimated monthly rent",
-            "rent_estimate_range": "Rent range",
-            "comparable_count": "Comparables",
-            "estimated_gross_yield_pct": "Estimated gross yield",
-            "estimated_yield_range": "Yield range",
-            "listing_observed_at": "Listing observed at",
+            "est_monthly_rent": "Monthly rent",
+            "gross_yield_pct": "Gross yield",
+            "observed_at": "Observed at",
         }
     )
-
     st.dataframe(
         table.style.format(
             {
                 "Beds": "{:.1f}",
                 "Baths": "{:.1f}",
                 "Square feet": "{:,.0f}",
-                "Asking price": money,
-                "Estimated monthly rent": money,
-                "Comparables": "{:,.0f}",
-                "Estimated gross yield": percent,
-                "Listing observed at": lambda value: (
-                    value.strftime("%Y-%m-%d %H:%M") if pd.notna(value) else "—"
-                ),
+                "Asking price": "${:,.0f}",
+                "Monthly rent": "${:,.0f}",
+                "Gross yield": "{:.2f}%",
+                "Observed at": timestamp_text,
             },
             na_rep="—",
         ),
@@ -464,6 +464,224 @@ def main() -> None:
 
     st.divider()
     render_scenario_calculator(filtered)
+
+
+def render_market_watchlist_dashboard() -> None:
+    """Render canonical market research with explicit data-quality context."""
+    st.header("Market Watchlist")
+    st.caption(
+        "Historical market research data stored in the canonical Oracle market model. "
+        "This is an educational watchlist, not a personal holdings ledger or investment recommendation."
+    )
+
+    try:
+        watchlist = load_market_watchlist_data()
+    except (ConfigurationError, Exception):
+        st.error(
+            "Unable to load market-watchlist data. Verify the database settings in .env "
+            "and confirm that the canonical market migrations have run."
+        )
+        return
+
+    if watchlist.empty:
+        st.info("No canonical market-watchlist securities are available yet.")
+        return
+
+    latest_price_date = watchlist["latest_trade_date"].max()
+    price_age_days = market_price_age_days(latest_price_date)
+    securities_with_prices = int(
+        (watchlist["price_history_status"] == "PRICE_AVAILABLE").sum()
+    )
+    securities_with_fundamentals = int(
+        (watchlist["fundamentals_status"] != "MISSING_FUNDAMENTALS").sum()
+    )
+    fundamentals_coverage = securities_with_fundamentals / len(watchlist) * 100
+
+    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+    metric_1.metric("Watchlist securities", f"{len(watchlist):,}")
+    metric_2.metric("Securities with price history", f"{securities_with_prices:,}")
+    metric_3.metric("Latest stored price date", timestamp_text(latest_price_date))
+    metric_4.metric("Fundamentals coverage", f"{fundamentals_coverage:.2f}%")
+
+    if price_age_days is None:
+        st.error(
+            "No latest market-price date is available. Do not interpret the watchlist as current market data."
+        )
+    elif price_age_days > 7:
+        st.error(
+            f"Market prices are {price_age_days} calendar days old. The market data-quality "
+            "gate currently fails its 7-day freshness threshold, so do not treat displayed "
+            "prices as live or use them for time-sensitive decisions."
+        )
+    else:
+        st.info(
+            f"Latest stored market prices are {price_age_days} calendar day(s) old. "
+            "They are historical reference data, not real-time quotes."
+        )
+
+    if fundamentals_coverage < 25:
+        st.warning(
+            f"Only {securities_with_fundamentals} of {len(watchlist)} securities have "
+            "fundamentals. Missing values are unknown; they are not zero or unfavorable values."
+        )
+
+    if (watchlist["fundamentals_status"] == "AVAILABLE_AS_OF_UNKNOWN").any():
+        st.warning(
+            "Available fundamentals do not have a verified provider as-of date. Treat them "
+            "as legacy historical context rather than current company financials."
+        )
+
+    with st.expander("How to interpret this market watchlist"):
+        st.markdown(
+            """
+            - **Latest close price** is the newest historical close stored in your database; it is not a live quote.
+            - **P/E, PEG, P/B, return on equity, and profit margin** are research metrics, not a recommendation or valuation model.
+            - **Missing fundamentals** means the database has no imported value for that security. It does not imply poor quality.
+            - **Free cash flow is intentionally not shown as currency** because the legacy source did not document its unit.
+            - This watchlist does not represent stocks you own. Personal holdings and cost basis will be added later through a separate portfolio-ledger model.
+            """
+        )
+
+    filter_left, filter_right = st.columns(2)
+    display_frame = watchlist.copy()
+    display_frame["sector_display"] = display_frame["sector"].fillna("Unclassified")
+    sectors = sorted(display_frame["sector_display"].unique().tolist())
+
+    with filter_left:
+        selected_sectors = st.multiselect(
+            "Sectors",
+            options=sectors,
+            default=sectors,
+            key="market_sectors",
+        )
+    with filter_right:
+        fundamentals_only = st.checkbox(
+            "Show only securities with fundamentals",
+            value=False,
+            key="market_fundamentals_only",
+        )
+
+    filtered = display_frame[display_frame["sector_display"].isin(selected_sectors)].copy()
+    if fundamentals_only:
+        filtered = filtered[
+            filtered["fundamentals_status"] != "MISSING_FUNDAMENTALS"
+        ].copy()
+
+    if filtered.empty:
+        st.warning("No securities match the selected watchlist filters.")
+        return
+
+    st.subheader("Watchlist comparison")
+    comparison = filtered[
+        [
+            "ticker",
+            "sector_display",
+            "latest_close_price",
+            "latest_trade_date",
+            "latest_volume",
+            "pe_ratio",
+            "peg_ratio",
+            "pb_ratio",
+            "earnings_per_share",
+            "return_on_equity_pct",
+            "profit_margin_pct",
+            "debt_to_equity_ratio",
+            "fundamentals_status",
+        ]
+    ].rename(
+        columns={
+            "ticker": "Ticker",
+            "sector_display": "Sector",
+            "latest_close_price": "Latest close price",
+            "latest_trade_date": "Latest price date",
+            "latest_volume": "Latest volume",
+            "pe_ratio": "P/E ratio",
+            "peg_ratio": "PEG ratio",
+            "pb_ratio": "P/B ratio",
+            "earnings_per_share": "EPS",
+            "return_on_equity_pct": "Return on equity",
+            "profit_margin_pct": "Profit margin",
+            "debt_to_equity_ratio": "Debt-to-equity",
+            "fundamentals_status": "Fundamentals status",
+        }
+    )
+    comparison = comparison.sort_values(by=["Sector", "Ticker"])
+
+    st.dataframe(
+        comparison.style.format(
+            {
+                "Latest close price": "${:,.2f}",
+                "Latest price date": timestamp_text,
+                "Latest volume": "{:,.0f}",
+                "P/E ratio": "{:.2f}",
+                "PEG ratio": "{:.2f}",
+                "P/B ratio": "{:.2f}",
+                "EPS": "{:.2f}",
+                "Return on equity": "{:.2f}%",
+                "Profit margin": "{:.2f}%",
+                "Debt-to-equity": "{:.2f}",
+            },
+            na_rep="—",
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.subheader("Historical close-price trend")
+    ticker_options = filtered["ticker"].tolist()
+    selected_ticker = st.selectbox(
+        "Choose a ticker",
+        options=ticker_options,
+        key="market_price_history_ticker",
+    )
+
+    try:
+        price_history = load_market_price_history(selected_ticker)
+    except (ConfigurationError, Exception):
+        st.error("Unable to load the selected ticker's historical price series.")
+        return
+
+    chart_frame = price_history.dropna(subset=["trade_date", "close_price"]).copy()
+    if chart_frame.empty:
+        st.info(f"No canonical price history is available for {selected_ticker}.")
+        return
+
+    latest_price = chart_frame.iloc[-1]
+    st.caption(
+        f"{selected_ticker}: {len(chart_frame):,} stored trading day(s), from "
+        f"{timestamp_text(chart_frame['trade_date'].min())} through "
+        f"{timestamp_text(chart_frame['trade_date'].max())}."
+    )
+    st.metric(
+        f"Latest stored {selected_ticker} close",
+        money(latest_price["close_price"]),
+        help="This is the latest close stored in Oracle, not a live market quote.",
+    )
+    st.line_chart(
+        chart_frame.set_index("trade_date")[["close_price"]].rename(
+            columns={"close_price": "Close price"}
+        )
+    )
+
+
+def main() -> None:
+    """Configure and render the two canonical investment-research sections."""
+    st.set_page_config(layout="wide", page_title="Personal Investment Dashboard")
+    st.title("Personal Investment Dashboard")
+    st.caption(
+        "A personal research dashboard for Houston real estate and market watchlists. "
+        "It is not financial, tax, legal, or investment advice."
+    )
+
+    real_estate_tab, market_tab = st.tabs(
+        ["🏠 Real Estate Opportunities", "📈 Market Watchlist"]
+    )
+
+    with real_estate_tab:
+        render_real_estate_dashboard()
+
+    with market_tab:
+        render_market_watchlist_dashboard()
 
 
 if __name__ == "__main__":

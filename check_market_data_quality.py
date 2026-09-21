@@ -1,0 +1,251 @@
+"""Read-only quality and freshness gate for canonical market-watchlist data.
+
+This command makes no API calls and writes no Oracle rows. It queries only
+PORTFOLIO_APP canonical market reporting objects and exits non-zero for errors.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import date, datetime
+from typing import Any
+
+import oracledb
+
+from portfolio_dashboard.data_quality import overall_status
+from portfolio_dashboard.database import managed_connection
+from portfolio_dashboard.market_data_quality import (
+    MarketQualitySummary,
+    MarketQualityThresholds,
+    evaluate_market_quality,
+)
+
+
+MARKET_QUALITY_SUMMARY_SQL = """
+    SELECT
+        COUNT(*) AS total_watchlist_securities,
+        SUM(
+            CASE
+                WHEN price_history_status = 'PRICE_AVAILABLE' THEN 1
+                ELSE 0
+            END
+        ) AS securities_with_price_history,
+        SUM(
+            CASE
+                WHEN price_history_status = 'MISSING_PRICE_HISTORY' THEN 1
+                ELSE 0
+            END
+        ) AS securities_missing_price_history,
+        SUM(
+            CASE
+                WHEN fundamentals_status <> 'MISSING_FUNDAMENTALS' THEN 1
+                ELSE 0
+            END
+        ) AS securities_with_fundamentals,
+        SUM(
+            CASE
+                WHEN fundamentals_status = 'MISSING_FUNDAMENTALS' THEN 1
+                ELSE 0
+            END
+        ) AS securities_missing_fundamentals,
+        SUM(
+            CASE
+                WHEN fundamentals_status = 'AVAILABLE_AS_OF_UNKNOWN' THEN 1
+                ELSE 0
+            END
+        ) AS fundamentals_with_unknown_as_of_date,
+        MIN(latest_trade_date) AS oldest_latest_price_date,
+        MAX(latest_trade_date) AS newest_latest_price_date
+    FROM vw_mk_watchlist_analysis
+"""
+
+DAILY_PRICE_DUPLICATES_SQL = """
+    SELECT COUNT(*) AS duplicate_daily_price_groups
+    FROM (
+        SELECT security_key, trade_date
+        FROM mk_daily_price
+        GROUP BY security_key, trade_date
+        HAVING COUNT(*) > 1
+    )
+"""
+
+
+def _row_as_dict(cursor: oracledb.Cursor) -> dict[str, Any]:
+    """Read exactly one Oracle result row using lowercase column names."""
+    row = cursor.fetchone()
+    if row is None:
+        return {}
+
+    columns = [description[0].lower() for description in cursor.description]
+    return dict(zip(columns, row, strict=True))
+
+
+def _as_int(value: Any) -> int:
+    """Normalize Oracle numeric aggregates, including null aggregates, to int."""
+    return int(value or 0)
+
+
+def _as_date_or_datetime(value: Any) -> date | datetime | None:
+    """Preserve an Oracle DATE or timestamp, while safely handling nulls."""
+    if value is None:
+        return None
+    if isinstance(value, (date, datetime)):
+        return value
+    raise TypeError(f"Expected an Oracle DATE or timestamp, received {type(value)!r}.")
+
+
+def fetch_market_quality_summary(cursor: oracledb.Cursor) -> MarketQualitySummary:
+    """Read canonical market completeness, uniqueness, and freshness metrics."""
+    cursor.execute(MARKET_QUALITY_SUMMARY_SQL)
+    summary_row = _row_as_dict(cursor)
+
+    cursor.execute(DAILY_PRICE_DUPLICATES_SQL)
+    duplicate_row = _row_as_dict(cursor)
+
+    return MarketQualitySummary(
+        total_watchlist_securities=_as_int(summary_row["total_watchlist_securities"]),
+        securities_with_price_history=_as_int(
+            summary_row["securities_with_price_history"]
+        ),
+        securities_missing_price_history=_as_int(
+            summary_row["securities_missing_price_history"]
+        ),
+        duplicate_daily_price_groups=_as_int(
+            duplicate_row["duplicate_daily_price_groups"]
+        ),
+        securities_with_fundamentals=_as_int(
+            summary_row["securities_with_fundamentals"]
+        ),
+        securities_missing_fundamentals=_as_int(
+            summary_row["securities_missing_fundamentals"]
+        ),
+        fundamentals_with_unknown_as_of_date=_as_int(
+            summary_row["fundamentals_with_unknown_as_of_date"]
+        ),
+        oldest_latest_price_date=_as_date_or_datetime(
+            summary_row["oldest_latest_price_date"]
+        ),
+        newest_latest_price_date=_as_date_or_datetime(
+            summary_row["newest_latest_price_date"]
+        ),
+    )
+
+
+def print_report(summary: MarketQualitySummary, issues: list) -> None:
+    """Print a concise market-quality report suitable for logs and CI."""
+    print("MARKET WATCHLIST DATA QUALITY AND FRESHNESS REPORT")
+    print()
+    print(f"Watchlist securities: {summary.total_watchlist_securities:,}")
+    print(
+        "Price-history coverage: "
+        f"{summary.securities_with_price_history:,}/"
+        f"{summary.total_watchlist_securities:,} "
+        f"({summary.price_history_coverage_pct or 0:.2f}%)"
+    )
+    print(
+        "Fundamentals coverage: "
+        f"{summary.securities_with_fundamentals:,}/"
+        f"{summary.total_watchlist_securities:,} "
+        f"({summary.fundamentals_coverage_pct or 0:.2f}%)"
+    )
+    print(
+        "Fundamental snapshots with unknown as-of date: "
+        f"{summary.fundamentals_with_unknown_as_of_date:,}"
+    )
+    print(
+        "Latest-price date range: "
+        f"{summary.oldest_latest_price_date or 'not available'} through "
+        f"{summary.newest_latest_price_date or 'not available'}"
+    )
+    print(
+        "Duplicate security/date daily-price groups: "
+        f"{summary.duplicate_daily_price_groups:,}"
+    )
+    print()
+
+    if not issues:
+        print("PASS: all configured market quality checks passed.")
+        return
+
+    for issue in issues:
+        print(f"{issue.severity.value}: {issue.check_name} — {issue.message}")
+    print()
+    print(f"Overall result: {overall_status(issues)}")
+
+
+def positive_float(value: str) -> float:
+    """Argparse validator for a positive, non-zero threshold."""
+    converted = float(value)
+    if converted <= 0:
+        raise argparse.ArgumentTypeError("Value must be greater than zero.")
+    return converted
+
+
+def percentage(value: str) -> float:
+    """Argparse validator for a percentage from zero through 100."""
+    converted = float(value)
+    if not 0 <= converted <= 100:
+        raise argparse.ArgumentTypeError("Percentage must be between 0 and 100.")
+    return converted
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build explicit, adjustable quality thresholds for market data."""
+    parser = argparse.ArgumentParser(
+        description="Run read-only market watchlist quality checks against Oracle."
+    )
+    parser.add_argument(
+        "--min-price-history-coverage-pct",
+        type=percentage,
+        default=100.0,
+        help="Fail below this latest-price coverage percentage (default: 100).",
+    )
+    parser.add_argument(
+        "--max-price-age-days",
+        type=positive_float,
+        default=7.0,
+        help="Fail when the newest market price is older than this many days (default: 7).",
+    )
+    parser.add_argument(
+        "--min-fundamentals-coverage-pct",
+        type=percentage,
+        default=25.0,
+        help="Warn below this fundamentals coverage percentage (default: 25).",
+    )
+    parser.add_argument(
+        "--fail-on-warning",
+        action="store_true",
+        help="Exit non-zero when warnings are found, for stricter scheduled checks.",
+    )
+    return parser
+
+
+def main() -> None:
+    """Run the read-only market quality gate with automation-friendly exits."""
+    args = build_parser().parse_args()
+    thresholds = MarketQualityThresholds(
+        min_price_history_coverage_pct=args.min_price_history_coverage_pct,
+        max_price_age_days=args.max_price_age_days,
+        min_fundamentals_coverage_pct=args.min_fundamentals_coverage_pct,
+    )
+
+    try:
+        with managed_connection() as connection:
+            with connection.cursor() as cursor:
+                summary = fetch_market_quality_summary(cursor)
+
+        issues = evaluate_market_quality(summary, thresholds)
+    except Exception as error:
+        print(f"FAIL: unable to run market quality check: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
+    print_report(summary, issues)
+    status = overall_status(issues)
+
+    if status == "FAIL" or (args.fail_on_warning and issues):
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

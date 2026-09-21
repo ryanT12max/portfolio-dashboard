@@ -12,4 +12,4 @@
 -- Run once while connected as PORTFOLIO_APP in Oracle Database Actions.
 
 ALTER TABLE mk_daily_price
-    MODIFY (close_price NUMBER NOT NULL);
+    MODIFY (close_price NUMBER);

@@ -24,6 +24,7 @@ DECLARE
     v_loaded_price_rows         NUMBER := 0;
     v_existing_fundamental_rows NUMBER;
     v_existing_price_rows       NUMBER;
+    v_error_message             VARCHAR2(1000);
 BEGIN
     SELECT COUNT(*)
     INTO v_existing_fundamental_rows
@@ -179,6 +180,7 @@ BEGIN
     COMMIT;
 EXCEPTION
     WHEN OTHERS THEN
+        v_error_message := SUBSTR(SQLERRM, 1, 1000);
         ROLLBACK;
 
         IF v_run_id IS NOT NULL THEN
@@ -191,7 +193,7 @@ EXCEPTION
                 validated_count = v_loaded_fundamental_rows + v_loaded_price_rows,
                 rejected_count = 0,
                 loaded_count = 0,
-                error_message = SUBSTR(SQLERRM, 1, 1000)
+                error_message = v_error_message
             WHERE run_id = v_run_id;
 
             COMMIT;

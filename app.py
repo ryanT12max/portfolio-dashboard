@@ -487,8 +487,13 @@ def render_market_watchlist_dashboard() -> None:
         st.info("No canonical market-watchlist securities are available yet.")
         return
 
-    latest_price_date = watchlist["latest_trade_date"].max()
-    price_age_days = market_price_age_days(latest_price_date)
+        oldest_latest_price_date = watchlist["latest_trade_date"].min()
+    newest_latest_price_date = watchlist["latest_trade_date"].max()
+
+    # Freshness is governed by the stalest security, not the most recently
+    # refreshed ticker in the watchlist.
+    price_age_days = market_price_age_days(oldest_latest_price_date)
+
     securities_with_prices = int(
         (watchlist["price_history_status"] == "PRICE_AVAILABLE").sum()
     )
@@ -500,23 +505,34 @@ def render_market_watchlist_dashboard() -> None:
     metric_1, metric_2, metric_3, metric_4 = st.columns(4)
     metric_1.metric("Watchlist securities", f"{len(watchlist):,}")
     metric_2.metric("Securities with price history", f"{securities_with_prices:,}")
-    metric_3.metric("Latest stored price date", timestamp_text(latest_price_date))
+    metric_3.metric(
+        "Oldest latest price date",
+        timestamp_text(oldest_latest_price_date),
+    )
     metric_4.metric("Fundamentals coverage", f"{fundamentals_coverage:.2f}%")
+
+    st.caption(
+        "Per-security latest-price dates range from "
+        f"{timestamp_text(oldest_latest_price_date)} through "
+        f"{timestamp_text(newest_latest_price_date)}."
+    )
 
     if price_age_days is None:
         st.error(
-            "No latest market-price date is available. Do not interpret the watchlist as current market data."
+            "No latest market-price date is available. Do not interpret the "
+            "watchlist as current market data."
         )
     elif price_age_days > 7:
         st.error(
-            f"Market prices are {price_age_days} calendar days old. The market data-quality "
-            "gate currently fails its 7-day freshness threshold, so do not treat displayed "
-            "prices as live or use them for time-sensitive decisions."
+            f"The oldest latest market price is {price_age_days} calendar days old. "
+            "The market data-quality gate currently fails its 7-day freshness "
+            "threshold, so do not treat displayed prices as live or use them for "
+            "time-sensitive decisions."
         )
     else:
         st.info(
-            f"Latest stored market prices are {price_age_days} calendar day(s) old. "
-            "They are historical reference data, not real-time quotes."
+            f"The oldest latest stored market price is {price_age_days} calendar "
+            "day(s) old. They are historical reference data, not real-time quotes."
         )
 
     if fundamentals_coverage < 25:

@@ -78,6 +78,20 @@ def test_stale_prices_are_an_error() -> None:
     assert overall_status(issues) == "FAIL"
 
 
+def test_one_fresh_ticker_cannot_hide_stale_watchlist_prices() -> None:
+    issues = evaluate_market_quality(
+        market_summary(
+            oldest_latest_price_date=date(2026, 9, 8),
+            newest_latest_price_date=date(2026, 9, 21),
+        ),
+        MarketQualityThresholds(max_price_age_days=7),
+        now=NOW,
+    )
+
+    assert "price_freshness" in check_names(issues)
+    assert overall_status(issues) == "FAIL"
+
+
 def test_incomplete_fundamentals_are_warnings() -> None:
     issues = evaluate_market_quality(
         market_summary(

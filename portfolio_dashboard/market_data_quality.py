@@ -95,29 +95,29 @@ def evaluate_market_quality(
             )
         )
 
-    price_coverage = summary.price_history_coverage_pct
-    if (
-        price_coverage is not None
-        and price_coverage < thresholds.min_price_history_coverage_pct
-    ):
+    coverage = summary.price_history_coverage_pct
+    if coverage is not None and coverage < thresholds.min_price_history_coverage_pct:
         issues.append(
             QualityIssue(
                 Severity.ERROR,
                 "price_history_coverage",
-                f"Latest-price coverage is {price_coverage:.2f}%, below the configured "
+                f"Latest-price coverage is {coverage:.2f}%, below the configured "
                 f"{thresholds.min_price_history_coverage_pct:.2f}% baseline. "
                 f"{summary.securities_missing_price_history} security or securities "
                 "have no price history.",
             )
         )
 
-    price_age_days = price_age_in_days(summary.newest_latest_price_date, now)
+    # Use the oldest per-security latest-price date. Using the newest date would
+    # let one freshly refreshed ticker hide stale prices for the rest of the
+    # watchlist.
+    price_age_days = price_age_in_days(summary.oldest_latest_price_date, now)
     if price_age_days is None:
         issues.append(
             QualityIssue(
                 Severity.ERROR,
                 "price_freshness",
-                "No latest market-price date is available.",
+                "No latest market-price date is available for the watchlist.",
             )
         )
     elif price_age_days > thresholds.max_price_age_days:
@@ -125,7 +125,8 @@ def evaluate_market_quality(
             QualityIssue(
                 Severity.ERROR,
                 "price_freshness",
-                f"Newest market price is {price_age_days:.0f} day(s) old, above the "
+                f"The oldest latest market price across the watchlist is "
+                f"{price_age_days:.0f} day(s) old, above the "
                 f"{thresholds.max_price_age_days:.0f}-day threshold.",
             )
         )

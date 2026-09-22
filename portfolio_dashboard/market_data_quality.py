@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 
 from portfolio_dashboard.data_quality import QualityIssue, Severity
 
@@ -16,6 +16,10 @@ class MarketQualitySummary:
     securities_with_price_history: int
     securities_missing_price_history: int
     duplicate_daily_price_groups: int
+    securities_with_current_quote: int
+    securities_missing_current_quote: int
+    oldest_current_quote_observed_at: date | datetime | None
+    newest_current_quote_observed_at: date | datetime | None
     securities_with_fundamentals: int
     securities_missing_fundamentals: int
     fundamentals_with_unknown_as_of_date: int
@@ -36,6 +40,13 @@ class MarketQualitySummary:
             return None
         return self.securities_with_fundamentals / self.total_watchlist_securities * 100
 
+    @property
+    def current_quote_coverage_pct(self) -> float | None:
+        """Return current-quote coverage only when securities exist."""
+        if self.total_watchlist_securities == 0:
+            return None
+        return self.securities_with_current_quote / self.total_watchlist_securities * 100
+
 
 @dataclass(frozen=True)
 class MarketQualityThresholds:
@@ -43,6 +54,8 @@ class MarketQualityThresholds:
 
     min_price_history_coverage_pct: float = 100.0
     max_price_age_days: float = 7.0
+    min_current_quote_coverage_pct: float = 100.0
+    max_current_quote_age_hours: float = 72.0
     min_fundamentals_coverage_pct: float = 25.0
 
 
@@ -65,6 +78,30 @@ def price_age_in_days(
     if latest_price_date is None:
         return None
     return float((_as_utc_date(now) - _as_utc_date(latest_price_date)).days)
+
+
+def quote_age_in_hours(
+    observed_at: date | datetime | None,
+    now: datetime,
+) -> float | None:
+    """Return elapsed hours since a quote was observed by the pipeline."""
+    if observed_at is None:
+        return None
+
+    if isinstance(observed_at, datetime):
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        else:
+            observed_at = observed_at.astimezone(timezone.utc)
+    else:
+        observed_at = datetime.combine(observed_at, time.min, tzinfo=timezone.utc)
+
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+
+    return (now - observed_at).total_seconds() / 3600
 
 
 def evaluate_market_quality(
@@ -92,6 +129,47 @@ def evaluate_market_quality(
                 "daily_price_duplicates",
                 f"{summary.duplicate_daily_price_groups} duplicate security/date "
                 "daily-price group(s) were found.",
+            )
+        )
+
+    quote_coverage = summary.current_quote_coverage_pct
+    if (
+        quote_coverage is not None
+        and quote_coverage < thresholds.min_current_quote_coverage_pct
+    ):
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "current_quote_coverage",
+                f"Current quote coverage is {quote_coverage:.2f}%, below the configured "
+                f"{thresholds.min_current_quote_coverage_pct:.2f}% baseline. "
+                f"{summary.securities_missing_current_quote} security or securities "
+                "have no current quote snapshot.",
+            )
+        )
+
+    # As with daily prices, use the oldest quote observation across the watchlist.
+    # One recently refreshed ticker must not hide stale quotes for other tickers.
+    quote_age_hours = quote_age_in_hours(
+        summary.oldest_current_quote_observed_at,
+        now,
+    )
+    if quote_age_hours is None:
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "current_quote_freshness",
+                "No current market-quote observation timestamp is available for the watchlist.",
+            )
+        )
+    elif quote_age_hours > thresholds.max_current_quote_age_hours:
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "current_quote_freshness",
+                f"The oldest current quote observation across the watchlist is "
+                f"{quote_age_hours:.1f} hour(s) old, above the "
+                f"{thresholds.max_current_quote_age_hours:.1f}-hour threshold.",
             )
         )
 

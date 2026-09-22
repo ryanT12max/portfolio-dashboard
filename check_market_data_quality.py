@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 import oracledb
@@ -27,37 +27,55 @@ MARKET_QUALITY_SUMMARY_SQL = """
         COUNT(*) AS total_watchlist_securities,
         SUM(
             CASE
-                WHEN price_history_status = 'PRICE_AVAILABLE' THEN 1
+                WHEN watchlist.price_history_status = 'PRICE_AVAILABLE' THEN 1
                 ELSE 0
             END
         ) AS securities_with_price_history,
         SUM(
             CASE
-                WHEN price_history_status = 'MISSING_PRICE_HISTORY' THEN 1
+                WHEN watchlist.price_history_status = 'MISSING_PRICE_HISTORY' THEN 1
                 ELSE 0
             END
         ) AS securities_missing_price_history,
         SUM(
             CASE
-                WHEN fundamentals_status <> 'MISSING_FUNDAMENTALS' THEN 1
+                WHEN current_quote.security_key IS NOT NULL THEN 1
+                ELSE 0
+            END
+        ) AS securities_with_current_quote,
+        SUM(
+            CASE
+                WHEN current_quote.security_key IS NULL THEN 1
+                ELSE 0
+            END
+        ) AS securities_missing_current_quote,
+        MIN(current_quote.observed_at) AS oldest_current_quote_observed_at,
+        MAX(current_quote.observed_at) AS newest_current_quote_observed_at,
+        SUM(
+            CASE
+                WHEN watchlist.fundamentals_status <> 'MISSING_FUNDAMENTALS' THEN 1
                 ELSE 0
             END
         ) AS securities_with_fundamentals,
         SUM(
             CASE
-                WHEN fundamentals_status = 'MISSING_FUNDAMENTALS' THEN 1
+                WHEN watchlist.fundamentals_status = 'MISSING_FUNDAMENTALS' THEN 1
                 ELSE 0
             END
         ) AS securities_missing_fundamentals,
         SUM(
             CASE
-                WHEN fundamentals_status = 'AVAILABLE_AS_OF_UNKNOWN' THEN 1
+                WHEN watchlist.fundamentals_status = 'AVAILABLE_AS_OF_UNKNOWN' THEN 1
                 ELSE 0
             END
         ) AS fundamentals_with_unknown_as_of_date,
-        MIN(latest_trade_date) AS oldest_latest_price_date,
-        MAX(latest_trade_date) AS newest_latest_price_date
-    FROM vw_mk_watchlist_analysis
+        MIN(watchlist.latest_trade_date) AS oldest_latest_price_date,
+        MAX(watchlist.latest_trade_date) AS newest_latest_price_date
+    FROM mk_security security
+    LEFT JOIN vw_mk_watchlist_analysis watchlist
+        ON watchlist.security_key = security.security_key
+    LEFT JOIN vw_mk_current_quote current_quote
+        ON current_quote.security_key = security.security_key
 """
 
 DAILY_PRICE_DUPLICATES_SQL = """
@@ -76,7 +94,6 @@ def _row_as_dict(cursor: oracledb.Cursor) -> dict[str, Any]:
     row = cursor.fetchone()
     if row is None:
         return {}
-
     columns = [description[0].lower() for description in cursor.description]
     return dict(zip(columns, row, strict=True))
 
@@ -114,6 +131,18 @@ def fetch_market_quality_summary(cursor: oracledb.Cursor) -> MarketQualitySummar
         duplicate_daily_price_groups=_as_int(
             duplicate_row["duplicate_daily_price_groups"]
         ),
+        securities_with_current_quote=_as_int(
+            summary_row["securities_with_current_quote"]
+        ),
+        securities_missing_current_quote=_as_int(
+            summary_row["securities_missing_current_quote"]
+        ),
+        oldest_current_quote_observed_at=_as_date_or_datetime(
+            summary_row["oldest_current_quote_observed_at"]
+        ),
+        newest_current_quote_observed_at=_as_date_or_datetime(
+            summary_row["newest_current_quote_observed_at"]
+        ),
         securities_with_fundamentals=_as_int(
             summary_row["securities_with_fundamentals"]
         ),
@@ -142,6 +171,17 @@ def print_report(summary: MarketQualitySummary, issues: list) -> None:
         f"{summary.securities_with_price_history:,}/"
         f"{summary.total_watchlist_securities:,} "
         f"({summary.price_history_coverage_pct or 0:.2f}%)"
+    )
+    print(
+        "Current-quote coverage: "
+        f"{summary.securities_with_current_quote:,}/"
+        f"{summary.total_watchlist_securities:,} "
+        f"({summary.current_quote_coverage_pct or 0:.2f}%)"
+    )
+    print(
+        "Current-quote observation range: "
+        f"{summary.oldest_current_quote_observed_at or 'not available'} through "
+        f"{summary.newest_current_quote_observed_at or 'not available'}"
     )
     print(
         "Fundamentals coverage: "
@@ -205,7 +245,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-price-age-days",
         type=positive_float,
         default=7.0,
-        help="Fail when the newest market price is older than this many days (default: 7).",
+        help=(
+            "Fail when the oldest per-security latest market price is older than "
+            "this many days (default: 7)."
+        ),
+    )
+    parser.add_argument(
+        "--min-current-quote-coverage-pct",
+        type=percentage,
+        default=100.0,
+        help="Fail below this current-quote coverage percentage (default: 100).",
+    )
+    parser.add_argument(
+        "--max-current-quote-age-hours",
+        type=positive_float,
+        default=72.0,
+        help="Fail when the oldest current quote is older than this many hours (default: 72).",
     )
     parser.add_argument(
         "--min-fundamentals-coverage-pct",
@@ -227,6 +282,8 @@ def main() -> None:
     thresholds = MarketQualityThresholds(
         min_price_history_coverage_pct=args.min_price_history_coverage_pct,
         max_price_age_days=args.max_price_age_days,
+        min_current_quote_coverage_pct=args.min_current_quote_coverage_pct,
+        max_current_quote_age_hours=args.max_current_quote_age_hours,
         min_fundamentals_coverage_pct=args.min_fundamentals_coverage_pct,
     )
 
@@ -234,7 +291,6 @@ def main() -> None:
         with managed_connection() as connection:
             with connection.cursor() as cursor:
                 summary = fetch_market_quality_summary(cursor)
-
         issues = evaluate_market_quality(summary, thresholds)
     except Exception as error:
         print(f"FAIL: unable to run market quality check: {error}", file=sys.stderr)
@@ -242,7 +298,6 @@ def main() -> None:
 
     print_report(summary, issues)
     status = overall_status(issues)
-
     if status == "FAIL" or (args.fail_on_warning and issues):
         raise SystemExit(1)
 

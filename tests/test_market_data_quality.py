@@ -10,6 +10,7 @@ from portfolio_dashboard.market_data_quality import (
     MarketQualityThresholds,
     evaluate_market_quality,
     price_age_in_days,
+    quote_age_in_hours,
 )
 
 
@@ -23,6 +24,14 @@ def market_summary(**overrides: object) -> MarketQualitySummary:
         "securities_with_price_history": 44,
         "securities_missing_price_history": 0,
         "duplicate_daily_price_groups": 0,
+        "securities_with_current_quote": 44,
+        "securities_missing_current_quote": 0,
+        "oldest_current_quote_observed_at": datetime(
+            2026, 9, 21, 8, tzinfo=timezone.utc
+        ),
+        "newest_current_quote_observed_at": datetime(
+            2026, 9, 21, 11, tzinfo=timezone.utc
+        ),
         "securities_with_fundamentals": 44,
         "securities_missing_fundamentals": 0,
         "fundamentals_with_unknown_as_of_date": 0,
@@ -64,6 +73,20 @@ def test_missing_price_history_is_an_error() -> None:
     assert overall_status(issues) == "FAIL"
 
 
+def test_missing_current_quotes_are_an_error() -> None:
+    issues = evaluate_market_quality(
+        market_summary(
+            securities_with_current_quote=43,
+            securities_missing_current_quote=1,
+        ),
+        MarketQualityThresholds(),
+        now=NOW,
+    )
+
+    assert "current_quote_coverage" in check_names(issues)
+    assert any(issue.severity == Severity.ERROR for issue in issues)
+
+
 def test_stale_prices_are_an_error() -> None:
     issues = evaluate_market_quality(
         market_summary(
@@ -90,6 +113,39 @@ def test_one_fresh_ticker_cannot_hide_stale_watchlist_prices() -> None:
 
     assert "price_freshness" in check_names(issues)
     assert overall_status(issues) == "FAIL"
+
+
+def test_stale_current_quotes_are_an_error() -> None:
+    issues = evaluate_market_quality(
+        market_summary(
+            oldest_current_quote_observed_at=datetime(
+                2026, 9, 17, 12, tzinfo=timezone.utc
+            ),
+            newest_current_quote_observed_at=datetime(
+                2026, 9, 17, 12, tzinfo=timezone.utc
+            ),
+        ),
+        MarketQualityThresholds(max_current_quote_age_hours=72),
+        now=NOW,
+    )
+
+    assert "current_quote_freshness" in check_names(issues)
+    assert overall_status(issues) == "FAIL"
+
+
+def test_one_fresh_quote_cannot_hide_stale_watchlist_quotes() -> None:
+    issues = evaluate_market_quality(
+        market_summary(
+            oldest_current_quote_observed_at=datetime(
+                2026, 9, 17, 12, tzinfo=timezone.utc
+            ),
+            newest_current_quote_observed_at=NOW,
+        ),
+        MarketQualityThresholds(max_current_quote_age_hours=72),
+        now=NOW,
+    )
+
+    assert "current_quote_freshness" in check_names(issues)
 
 
 def test_incomplete_fundamentals_are_warnings() -> None:
@@ -124,3 +180,8 @@ def test_duplicate_daily_prices_are_an_error() -> None:
 
 def test_price_age_uses_calendar_days() -> None:
     assert price_age_in_days(date(2026, 9, 8), NOW) == 13.0
+
+
+def test_quote_age_uses_elapsed_hours() -> None:
+    observed_at = datetime(2026, 9, 21, 6, tzinfo=timezone.utc)
+    assert quote_age_in_hours(observed_at, NOW) == 6.0

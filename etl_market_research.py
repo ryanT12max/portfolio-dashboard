@@ -217,20 +217,34 @@ def fetch_candle_payload(
     start_at: datetime,
     end_at: datetime,
 ) -> FinnhubCandlePayload:
-    """Fetch a recent daily-candle response without logging the API key."""
-    response = session.get(
-        FINNHUB_CANDLE_URL,
-        params={
-            "symbol": ticker,
-            "resolution": "D",
-            "from": int(start_at.timestamp()),
-            "to": int(end_at.timestamp()),
-            "token": api_key,
-        },
-        headers={"accept": "application/json"},
-        timeout=20,
-    )
-    response.raise_for_status()
+    """Fetch a daily-candle response without exposing the API key in errors."""
+    try:
+        response = session.get(
+            FINNHUB_CANDLE_URL,
+            params={
+                "symbol": ticker,
+                "resolution": "D",
+                "from": int(start_at.timestamp()),
+                "to": int(end_at.timestamp()),
+                "token": api_key,
+            },
+            headers={"accept": "application/json"},
+            timeout=20,
+        )
+    except requests.RequestException:
+        # Do not chain the original Requests exception: its message can contain
+        # the full query URL, including the token parameter.
+        raise RuntimeError(
+            f"Finnhub candle request could not be completed for ticker {ticker}."
+        ) from None
+
+    if response.status_code >= 400:
+        # Do not call response.raise_for_status(); its HTTPError message includes
+        # the request URL and would expose the API key in logs and MK_ETL_RUN.
+        raise RuntimeError(
+            "Finnhub candle request failed for ticker "
+            f"{ticker} with HTTP status {response.status_code}."
+        )
 
     try:
         payload = response.json()

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
+import requests
 from pydantic import ValidationError
 
 from etl_market_research import (
     FinnhubCandlePayload,
     MarketSecurity,
+    fetch_candle_payload,
     validate_daily_price_records,
     validate_limit,
     validate_lookback_days,
@@ -79,3 +81,45 @@ def test_validate_daily_price_records_converts_daily_candles() -> None:
     assert records[0].close_price == 100.25
     assert records[1].volume == 2_000
     assert all(record.trade_date >= date(2026, 1, 1) for record in records)
+
+
+class _StaticResponse:
+    """Minimal response double for a provider HTTP-status failure."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+
+class _HttpFailureSession:
+    """Return a fixed HTTP failure without making a network request."""
+
+    def get(self, *args: object, **kwargs: object) -> _StaticResponse:
+        return _StaticResponse(403)
+
+
+class _RequestFailureSession:
+    """Raise a Requests error containing a synthetic token-like value."""
+
+    def get(self, *args: object, **kwargs: object) -> _StaticResponse:
+        raise requests.RequestException(
+            "request failed for https://example.test/?token=test-token-must-not-appear"
+        )
+
+
+@pytest.mark.parametrize(
+    "session",
+    [_HttpFailureSession(), _RequestFailureSession()],
+)
+def test_provider_errors_do_not_expose_the_api_key(session: object) -> None:
+    with pytest.raises(RuntimeError) as captured_error:
+        fetch_candle_payload(
+            session,  # type: ignore[arg-type]
+            ticker="AAPL",
+            api_key="test-token-must-not-appear",
+            start_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+            end_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+
+    error_message = str(captured_error.value)
+    assert "test-token-must-not-appear" not in error_message
+    assert "AAPL" in error_message

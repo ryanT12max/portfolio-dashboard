@@ -9,6 +9,7 @@ from portfolio_dashboard.market_data_quality import (
     MarketQualitySummary,
     MarketQualityThresholds,
     evaluate_market_quality,
+    evaluate_quote_refresh_quality,
     price_age_in_days,
     quote_age_in_hours,
 )
@@ -85,6 +86,35 @@ def test_missing_current_quotes_are_an_error() -> None:
 
     assert "current_quote_coverage" in check_names(issues)
     assert any(issue.severity == Severity.ERROR for issue in issues)
+
+
+def test_quote_refresh_scope_ignores_known_legacy_research_gaps() -> None:
+    issues = evaluate_quote_refresh_quality(
+        market_summary(
+            securities_with_fundamentals=3,
+            securities_missing_fundamentals=41,
+            fundamentals_with_unknown_as_of_date=3,
+            oldest_latest_price_date=date(2026, 9, 8),
+            newest_latest_price_date=date(2026, 9, 8),
+        ),
+        MarketQualityThresholds(max_current_quote_age_hours=30),
+        now=NOW,
+    )
+
+    assert issues == []
+
+
+def test_quote_refresh_scope_still_fails_for_missing_quotes() -> None:
+    issues = evaluate_quote_refresh_quality(
+        market_summary(
+            securities_with_current_quote=43,
+            securities_missing_current_quote=1,
+        ),
+        MarketQualityThresholds(),
+        now=NOW,
+    )
+
+    assert check_names(issues) == {"current_quote_coverage"}
 
 
 def test_stale_prices_are_an_error() -> None:

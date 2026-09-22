@@ -9,16 +9,17 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 import oracledb
 
-from portfolio_dashboard.data_quality import overall_status
+from portfolio_dashboard.data_quality import QualityIssue, overall_status
 from portfolio_dashboard.database import managed_connection
 from portfolio_dashboard.market_data_quality import (
     MarketQualitySummary,
     MarketQualityThresholds,
     evaluate_market_quality,
+    evaluate_quote_refresh_quality,
 )
 
 
@@ -87,6 +88,8 @@ DAILY_PRICE_DUPLICATES_SQL = """
         HAVING COUNT(*) > 1
     )
 """
+
+QualityScope = Literal["full", "quote-refresh"]
 
 
 def _row_as_dict(cursor: oracledb.Cursor) -> dict[str, Any]:
@@ -161,9 +164,36 @@ def fetch_market_quality_summary(cursor: oracledb.Cursor) -> MarketQualitySummar
     )
 
 
-def print_report(summary: MarketQualitySummary, issues: list) -> None:
+def run_market_quality_check(
+    thresholds: MarketQualityThresholds,
+    scope: QualityScope = "full",
+) -> tuple[MarketQualitySummary, list[QualityIssue]]:
+    """Run one read-only quality scope and return its summary plus issues."""
+    if scope not in ("full", "quote-refresh"):
+        raise ValueError(f"Unsupported market quality scope: {scope}.")
+
+    with managed_connection() as connection:
+        with connection.cursor() as cursor:
+            summary = fetch_market_quality_summary(cursor)
+
+    if scope == "quote-refresh":
+        issues = evaluate_quote_refresh_quality(summary, thresholds)
+    else:
+        issues = evaluate_market_quality(summary, thresholds)
+    return summary, issues
+
+
+def print_report(
+    summary: MarketQualitySummary,
+    issues: list[QualityIssue],
+    scope: QualityScope = "full",
+) -> None:
     """Print a concise market-quality report suitable for logs and CI."""
-    print("MARKET WATCHLIST DATA QUALITY AND FRESHNESS REPORT")
+    if scope == "quote-refresh":
+        print("MARKET QUOTE REFRESH QUALITY REPORT")
+        print("Scope: current quote coverage and observation freshness only.")
+    else:
+        print("MARKET WATCHLIST DATA QUALITY AND FRESHNESS REPORT")
     print()
     print(f"Watchlist securities: {summary.total_watchlist_securities:,}")
     print(
@@ -205,7 +235,13 @@ def print_report(summary: MarketQualitySummary, issues: list) -> None:
     print()
 
     if not issues:
-        print("PASS: all configured market quality checks passed.")
+        if scope == "quote-refresh":
+            print(
+                "PASS: quote-refresh coverage and freshness checks passed. "
+                "Historical daily-price and fundamentals checks were not evaluated in this scope."
+            )
+        else:
+            print("PASS: all configured market quality checks passed.")
         return
 
     for issue in issues:
@@ -240,6 +276,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=percentage,
         default=100.0,
         help="Fail below this latest-price coverage percentage (default: 100).",
+    )
+    parser.add_argument(
+        "--scope",
+        choices=("full", "quote-refresh"),
+        default="full",
+        help=(
+            "Quality gate to run: full evaluates all market data; quote-refresh evaluates "
+            "only current-quote coverage and freshness (default: full)."
+        ),
     )
     parser.add_argument(
         "--max-price-age-days",
@@ -288,15 +333,12 @@ def main() -> None:
     )
 
     try:
-        with managed_connection() as connection:
-            with connection.cursor() as cursor:
-                summary = fetch_market_quality_summary(cursor)
-        issues = evaluate_market_quality(summary, thresholds)
+        summary, issues = run_market_quality_check(thresholds, args.scope)
     except Exception as error:
         print(f"FAIL: unable to run market quality check: {error}", file=sys.stderr)
         raise SystemExit(1) from error
 
-    print_report(summary, issues)
+    print_report(summary, issues, args.scope)
     status = overall_status(issues)
     if status == "FAIL" or (args.fail_on_warning and issues):
         raise SystemExit(1)

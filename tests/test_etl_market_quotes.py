@@ -9,25 +9,44 @@ import requests
 from pydantic import ValidationError
 
 from etl_market_quotes import (
+    DAILY_REFRESH_LIMIT,
+    DEFAULT_PILOT_LIMIT,
     FinnhubQuotePayload,
     QUOTE_CANDIDATE_QUERY,
     QuoteCandidate,
     build_quote_snapshot,
     fetch_quote_payload,
+    resolve_refresh_limit,
     validate_candidate_rows,
     validate_limit,
+    validate_pilot_limit,
 )
 
 
-def test_validate_limit_accepts_the_pilot_bounds() -> None:
+def test_validate_limit_accepts_the_daily_refresh_bounds() -> None:
     assert validate_limit(1) == 1
-    assert validate_limit(10) == 10
+    assert validate_limit(DAILY_REFRESH_LIMIT) == DAILY_REFRESH_LIMIT
 
 
-@pytest.mark.parametrize("value", [0, 11])
-def test_validate_limit_rejects_values_outside_the_pilot_cap(value: int) -> None:
-    with pytest.raises(ValueError, match="Pilot limit must be between 1 and 10"):
+@pytest.mark.parametrize("value", [0, DAILY_REFRESH_LIMIT + 1])
+def test_validate_limit_rejects_values_outside_the_daily_cap(value: int) -> None:
+    with pytest.raises(ValueError, match="Refresh limit must be between 1 and 100"):
         validate_limit(value)
+
+
+def test_resolve_refresh_limit_uses_a_small_default_pilot() -> None:
+    assert resolve_refresh_limit(False, None) == DEFAULT_PILOT_LIMIT
+    assert resolve_refresh_limit(False, 10) == 10
+
+
+def test_resolve_refresh_limit_uses_the_explicit_daily_cap() -> None:
+    assert resolve_refresh_limit(True, None) == DAILY_REFRESH_LIMIT
+
+    with pytest.raises(ValueError, match="--daily-refresh cannot be combined"):
+        resolve_refresh_limit(True, 10)
+
+    with pytest.raises(ValueError, match="Pilot limit must be between 1 and 10"):
+        validate_pilot_limit(11)
 
 
 def test_validate_candidate_rows_accepts_a_canonical_ticker() -> None:

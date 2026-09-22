@@ -1,8 +1,10 @@
-"""Validate or refresh capped canonical market-quote snapshots from Finnhub.
+"""Validate or refresh canonical market-quote snapshots from Finnhub.
 
 Dry-run mode reads and validates canonical securities only. Live mode requires
 an explicit confirmation, fetches current Finnhub quotes, validates them, and
-inserts historical snapshots into PORTFOLIO_APP.MK_QUOTE_SNAPSHOT.
+inserts immutable snapshots into PORTFOLIO_APP.MK_QUOTE_SNAPSHOT. The explicit
+daily-refresh mode processes the complete eligible watchlist, up to a fixed
+safety cap, and can verify quote coverage and freshness after loading.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import argparse
 import hashlib
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable, Sequence
@@ -27,14 +30,21 @@ from pydantic import (
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from check_market_data_quality import print_report, run_market_quality_check
 from portfolio_dashboard.config import ConfigurationError, get_settings
+from portfolio_dashboard.data_quality import overall_status
 from portfolio_dashboard.database import managed_connection
+from portfolio_dashboard.market_data_quality import MarketQualityThresholds
 
 
 FINNHUB_QUOTE_URL = "https://finnhub.io/api/v1/quote"
 QUOTE_SOURCE = "FINNHUB_QUOTE"
 DEFAULT_PILOT_LIMIT = 1
 MAX_PILOT_LIMIT = 10
+DAILY_REFRESH_LIMIT = 100
+DEFAULT_REQUEST_DELAY_SECONDS = 0.25
+MAX_REQUEST_DELAY_SECONDS = 5.0
+DAILY_QUOTE_MAX_AGE_HOURS = 30.0
 
 
 logging.basicConfig(
@@ -161,10 +171,42 @@ CANDIDATE_COLUMNS = ("security_key", "ticker", "sector")
 
 
 def validate_limit(value: int) -> int:
-    """Bound the pilot to a small, deliberate number of provider requests."""
+    """Bound one refresh run to the fixed API-usage safety cap."""
+    if not 1 <= value <= DAILY_REFRESH_LIMIT:
+        raise ValueError(
+            f"Refresh limit must be between 1 and {DAILY_REFRESH_LIMIT}; received {value}."
+        )
+    return value
+
+
+def validate_pilot_limit(value: int) -> int:
+    """Keep the manual pilot mode deliberately small."""
     if not 1 <= value <= MAX_PILOT_LIMIT:
         raise ValueError(
             f"Pilot limit must be between 1 and {MAX_PILOT_LIMIT}; received {value}."
+        )
+    return value
+
+
+def resolve_refresh_limit(
+    daily_refresh: bool,
+    requested_limit: int | None,
+) -> int:
+    """Select either a small pilot or the fixed all-watchlist daily cap."""
+    if daily_refresh:
+        if requested_limit is not None:
+            raise ValueError("--daily-refresh cannot be combined with --limit.")
+        return DAILY_REFRESH_LIMIT
+
+    return validate_pilot_limit(requested_limit or DEFAULT_PILOT_LIMIT)
+
+
+def validate_request_delay_seconds(value: float) -> float:
+    """Keep voluntary inter-request pacing within a practical safety range."""
+    if not 0 <= value <= MAX_REQUEST_DELAY_SECONDS:
+        raise ValueError(
+            "Request delay must be between 0 and "
+            f"{MAX_REQUEST_DELAY_SECONDS:g} seconds; received {value}."
         )
     return value
 
@@ -484,16 +526,21 @@ def run_dry_run(limit: int) -> CandidateMetrics:
     return metrics
 
 
-def run_live_pilot(limit: int) -> PipelineMetrics:
-    """Fetch and insert a small, confirmed set of market-quote snapshots."""
+def run_live_refresh(
+    limit: int,
+    request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS,
+) -> PipelineMetrics:
+    """Fetch and insert confirmed quote snapshots for eligible securities."""
     limit = validate_limit(limit)
+    request_delay_seconds = validate_request_delay_seconds(request_delay_seconds)
     api_key = _require_finnhub_api_key()
     session = build_http_session()
 
     logger.info(
-        "Starting live market-quote pilot: source=%s, securities=%s.",
+        "Starting live market-quote refresh: source=%s, limit=%s, request_delay_seconds=%.2f.",
         QUOTE_SOURCE,
         limit,
+        request_delay_seconds,
     )
 
     with managed_connection() as connection:
@@ -509,7 +556,7 @@ def run_live_pilot(limit: int) -> PipelineMetrics:
                 rejected_count = candidate_metrics.rejected_count
                 loaded_count = 0
 
-                for candidate in candidates:
+                for index, candidate in enumerate(candidates):
                     quote_payload = fetch_quote_payload(
                         session=session,
                         ticker=candidate.ticker,
@@ -521,11 +568,13 @@ def run_live_pilot(limit: int) -> PipelineMetrics:
                     insert_quote_snapshot(cursor, quote_snapshot, run_id)
                     loaded_count += 1
 
+                    if index < len(candidates) - 1 and request_delay_seconds > 0:
+                        time.sleep(request_delay_seconds)
+
                 if not candidates:
-                    raise RuntimeError("No valid canonical securities were available for the pilot.")
-                if loaded_count == 0:
-                    raise RuntimeError(
-                        "Live market-quote pilot received no valid quotes; no snapshots were committed."
+                    logger.info(
+                        "No eligible securities require a quote refresh today. "
+                        "The run will complete successfully as an idempotent no-op."
                     )
 
                 metrics = PipelineMetrics(
@@ -540,11 +589,11 @@ def run_live_pilot(limit: int) -> PipelineMetrics:
                 connection.rollback()
                 fail_run(cursor, run_id, str(error))
                 connection.commit()
-                logger.exception("Live market-quote pilot run %s failed.", run_id)
+                logger.exception("Live market-quote refresh run %s failed.", run_id)
                 raise
 
     logger.info(
-        "Live market-quote pilot run %s completed: extracted=%s, validated=%s, "
+        "Live market-quote refresh run %s completed: extracted=%s, validated=%s, "
         "rejected=%s, loaded=%s.",
         run_id,
         metrics.extracted_count,
@@ -553,6 +602,29 @@ def run_live_pilot(limit: int) -> PipelineMetrics:
         metrics.loaded_count,
     )
     return metrics
+
+
+def verify_quote_refresh_quality() -> None:
+    """Run the read-only daily quote gate after a successful refresh."""
+    thresholds = MarketQualityThresholds(
+        max_current_quote_age_hours=DAILY_QUOTE_MAX_AGE_HOURS,
+    )
+    summary, issues = run_market_quality_check(
+        thresholds,
+        scope="quote-refresh",
+    )
+    print_report(summary, issues, scope="quote-refresh")
+
+    if overall_status(issues) == "FAIL":
+        raise RuntimeError(
+            "Market quote refresh completed, but the quote-refresh quality gate failed."
+        )
+
+    logger.info(
+        "Quote-refresh quality gate passed: coverage=%s/%s.",
+        summary.securities_with_current_quote,
+        summary.total_watchlist_securities,
+    )
 
 
 def positive_int(value: str) -> int:
@@ -566,10 +638,23 @@ def positive_int(value: str) -> int:
     return converted
 
 
+def nonnegative_float(value: str) -> float:
+    """Argparse validator for a non-negative request pacing value."""
+    try:
+        converted = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Value must be a number.") from error
+
+    try:
+        return validate_request_delay_seconds(converted)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def build_parser() -> argparse.ArgumentParser:
-    """Build dry-run and explicit-confirmation controls for quote enrichment."""
+    """Build dry-run, pilot, and daily-refresh controls for quote enrichment."""
     parser = argparse.ArgumentParser(
-        description="Validate or refresh capped canonical market-quote snapshots."
+        description="Validate or refresh canonical market-quote snapshots."
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
@@ -588,28 +673,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="Required with --live to acknowledge API usage and Oracle writes.",
     )
     parser.add_argument(
+        "--daily-refresh",
+        action="store_true",
+        help=(
+            "Process every security not successfully quoted today, up to the fixed "
+            f"{DAILY_REFRESH_LIMIT}-security safety cap. Cannot be combined with --limit."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=positive_int,
-        default=DEFAULT_PILOT_LIMIT,
-        help=f"Securities to process (1-{MAX_PILOT_LIMIT}; default: %(default)s).",
+        default=None,
+        help=(
+            f"Small pilot size (1-{MAX_PILOT_LIMIT}; default: {DEFAULT_PILOT_LIMIT}). "
+            "Do not use with --daily-refresh."
+        ),
+    )
+    parser.add_argument(
+        "--request-delay-seconds",
+        type=nonnegative_float,
+        default=DEFAULT_REQUEST_DELAY_SECONDS,
+        help=(
+            "Delay between provider requests during live refreshes "
+            f"(0-{MAX_REQUEST_DELAY_SECONDS:g}; default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--verify-quote-quality",
+        action="store_true",
+        help=(
+            "After a live refresh, run the read-only quote coverage and freshness gate "
+            f"using a {DAILY_QUOTE_MAX_AGE_HOURS:g}-hour freshness threshold."
+        ),
     )
     return parser
 
 
 def main() -> None:
-    """Run either the no-call gate or the explicitly confirmed live quote pilot."""
+    """Run a no-call gate, small pilot, or confirmed daily quote refresh."""
     parser = build_parser()
     args = parser.parse_args()
 
     try:
+        limit = resolve_refresh_limit(args.daily_refresh, args.limit)
+    except ValueError as error:
+        parser.error(str(error))
+
+    try:
         if args.dry_run:
-            run_dry_run(args.limit)
+            if args.verify_quote_quality:
+                parser.error("--verify-quote-quality requires --live.")
+            run_dry_run(limit)
             return
 
         if not args.confirm_live_run:
             parser.error("--live requires --confirm-live-run.")
 
-        run_live_pilot(args.limit)
+        run_live_refresh(limit, args.request_delay_seconds)
+        if args.verify_quote_quality:
+            verify_quote_refresh_quality()
     except Exception:
         logger.exception("Market-quote pipeline failed.")
         raise SystemExit(1)

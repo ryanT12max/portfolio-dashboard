@@ -104,6 +104,82 @@ def quote_age_in_hours(
     return (now - observed_at).total_seconds() / 3600
 
 
+def _append_quote_refresh_issues(
+    issues: list[QualityIssue],
+    summary: MarketQualitySummary,
+    thresholds: MarketQualityThresholds,
+    now: datetime,
+) -> None:
+    """Append quote coverage and freshness failures to an existing issue list."""
+    quote_coverage = summary.current_quote_coverage_pct
+    if (
+        quote_coverage is not None
+        and quote_coverage < thresholds.min_current_quote_coverage_pct
+    ):
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "current_quote_coverage",
+                f"Current quote coverage is {quote_coverage:.2f}%, below the configured "
+                f"{thresholds.min_current_quote_coverage_pct:.2f}% baseline. "
+                f"{summary.securities_missing_current_quote} security or securities "
+                "have no current quote snapshot.",
+            )
+        )
+
+    # Use the oldest quote observation across the watchlist. One recently
+    # refreshed ticker must not hide stale quotes for other tickers.
+    quote_age_hours = quote_age_in_hours(
+        summary.oldest_current_quote_observed_at,
+        now,
+    )
+    if quote_age_hours is None:
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "current_quote_freshness",
+                "No current market-quote observation timestamp is available for the watchlist.",
+            )
+        )
+    elif quote_age_hours > thresholds.max_current_quote_age_hours:
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "current_quote_freshness",
+                f"The oldest current quote observation across the watchlist is "
+                f"{quote_age_hours:.1f} hour(s) old, above the "
+                f"{thresholds.max_current_quote_age_hours:.1f}-hour threshold.",
+            )
+        )
+
+
+def evaluate_quote_refresh_quality(
+    summary: MarketQualitySummary,
+    thresholds: MarketQualityThresholds,
+    now: datetime | None = None,
+) -> list[QualityIssue]:
+    """Evaluate only the daily quote-refresh service-level expectations.
+
+    Historical daily-price and fundamentals checks intentionally remain out of
+    this scope so a successful quote refresh is not misreported as failed by
+    known, separately governed legacy research data.
+    """
+    now = now or datetime.now(timezone.utc)
+    issues: list[QualityIssue] = []
+
+    if summary.total_watchlist_securities == 0:
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "watchlist_population",
+                "No securities were found in the canonical market watchlist.",
+            )
+        )
+
+    _append_quote_refresh_issues(issues, summary, thresholds, now)
+    return issues
+
+
 def evaluate_market_quality(
     summary: MarketQualitySummary,
     thresholds: MarketQualityThresholds,
@@ -132,46 +208,7 @@ def evaluate_market_quality(
             )
         )
 
-    quote_coverage = summary.current_quote_coverage_pct
-    if (
-        quote_coverage is not None
-        and quote_coverage < thresholds.min_current_quote_coverage_pct
-    ):
-        issues.append(
-            QualityIssue(
-                Severity.ERROR,
-                "current_quote_coverage",
-                f"Current quote coverage is {quote_coverage:.2f}%, below the configured "
-                f"{thresholds.min_current_quote_coverage_pct:.2f}% baseline. "
-                f"{summary.securities_missing_current_quote} security or securities "
-                "have no current quote snapshot.",
-            )
-        )
-
-    # As with daily prices, use the oldest quote observation across the watchlist.
-    # One recently refreshed ticker must not hide stale quotes for other tickers.
-    quote_age_hours = quote_age_in_hours(
-        summary.oldest_current_quote_observed_at,
-        now,
-    )
-    if quote_age_hours is None:
-        issues.append(
-            QualityIssue(
-                Severity.ERROR,
-                "current_quote_freshness",
-                "No current market-quote observation timestamp is available for the watchlist.",
-            )
-        )
-    elif quote_age_hours > thresholds.max_current_quote_age_hours:
-        issues.append(
-            QualityIssue(
-                Severity.ERROR,
-                "current_quote_freshness",
-                f"The oldest current quote observation across the watchlist is "
-                f"{quote_age_hours:.1f} hour(s) old, above the "
-                f"{thresholds.max_current_quote_age_hours:.1f}-hour threshold.",
-            )
-        )
+    _append_quote_refresh_issues(issues, summary, thresholds, now)
 
     coverage = summary.price_history_coverage_pct
     if coverage is not None and coverage < thresholds.min_price_history_coverage_pct:

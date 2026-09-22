@@ -137,12 +137,22 @@ QUOTE_CANDIDATE_QUERY = """
         sector
     FROM (
         SELECT
-            security_key,
-            ticker,
-            sector
-        FROM mk_security
-        WHERE ticker IS NOT NULL
-        ORDER BY ticker
+            security.security_key,
+            security.ticker,
+            security.sector
+        FROM mk_security security
+        WHERE security.ticker IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM mk_quote_snapshot snapshot
+              JOIN mk_etl_run run_audit
+                  ON run_audit.run_id = snapshot.run_id
+                 AND run_audit.run_status IN ('SUCCEEDED', 'PARTIAL')
+              WHERE snapshot.security_key = security.security_key
+                AND TRUNC(CAST(snapshot.observed_at AT TIME ZONE 'UTC' AS DATE))
+                    = TRUNC(CAST(SYSTIMESTAMP AT TIME ZONE 'UTC' AS DATE))
+          )
+        ORDER BY security.ticker
     )
     WHERE ROWNUM <= :limit
 """
@@ -187,7 +197,7 @@ def load_quote_candidates(
     cursor: oracledb.Cursor,
     limit: int,
 ) -> tuple[list[QuoteCandidate], CandidateMetrics]:
-    """Read and validate candidate securities without a provider call or write."""
+    """Read unquoted-today candidates without a provider call or database write."""
     limit = validate_limit(limit)
     cursor.execute(QUOTE_CANDIDATE_QUERY, {"limit": limit})
     rows = cursor.fetchall()

@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from etl_market_quotes import (
     FinnhubQuotePayload,
+    QUOTE_CANDIDATE_QUERY,
     QuoteCandidate,
     build_quote_snapshot,
     fetch_quote_payload,
@@ -47,6 +48,15 @@ def test_validate_candidate_rows_rejects_an_invalid_ticker() -> None:
 
     assert candidates == []
     assert rejected_count == 1
+
+
+def test_candidate_query_skips_successful_quotes_observed_today() -> None:
+    normalized_query = " ".join(QUOTE_CANDIDATE_QUERY.split())
+
+    assert "NOT EXISTS" in normalized_query
+    assert "mk_quote_snapshot snapshot" in normalized_query
+    assert "run_audit.run_status IN ('SUCCEEDED', 'PARTIAL')" in normalized_query
+    assert "snapshot.observed_at AT TIME ZONE 'UTC'" in normalized_query
 
 
 def test_finnhub_quote_payload_rejects_an_invalid_day_range() -> None:

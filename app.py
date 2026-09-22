@@ -61,32 +61,45 @@ LATEST_REAL_ESTATE_RUN_SQL = """
 
 MARKET_WATCHLIST_SQL = """
     SELECT
-        security_key,
-        ticker,
-        sector,
-        latest_trade_date,
-        latest_close_price,
-        latest_volume,
-        latest_price_source,
-        latest_price_observed_at,
-        fundamental_snapshot_id,
-        fundamentals_source,
-        fundamentals_source_as_of_date,
-        fundamentals_observed_at,
-        fundamental_market_price,
-        pe_ratio,
-        peg_ratio,
-        pb_ratio,
-        earnings_per_share,
-        return_on_equity_pct,
-        profit_margin_pct,
-        debt_to_equity_ratio,
-        free_cash_flow_value,
-        free_cash_flow_unit,
-        price_history_status,
-        fundamentals_status
-    FROM vw_mk_watchlist_analysis
-    ORDER BY ticker
+        watchlist.security_key,
+        watchlist.ticker,
+        watchlist.sector,
+        quote.quote_snapshot_id,
+        quote.current_price AS current_quote_price,
+        quote.prior_close_price AS quote_prior_close_price,
+        quote.change_amount AS quote_change_amount,
+        quote.change_pct AS quote_change_pct,
+        quote.day_open_price AS quote_day_open_price,
+        quote.day_high_price AS quote_day_high_price,
+        quote.day_low_price AS quote_day_low_price,
+        quote.provider_quote_at,
+        quote.observed_at AS quote_observed_at,
+        quote.source_name AS quote_source_name,
+        watchlist.latest_trade_date,
+        watchlist.latest_close_price,
+        watchlist.latest_volume,
+        watchlist.latest_price_source,
+        watchlist.latest_price_observed_at,
+        watchlist.fundamental_snapshot_id,
+        watchlist.fundamentals_source,
+        watchlist.fundamentals_source_as_of_date,
+        watchlist.fundamentals_observed_at,
+        watchlist.fundamental_market_price,
+        watchlist.pe_ratio,
+        watchlist.peg_ratio,
+        watchlist.pb_ratio,
+        watchlist.earnings_per_share,
+        watchlist.return_on_equity_pct,
+        watchlist.profit_margin_pct,
+        watchlist.debt_to_equity_ratio,
+        watchlist.free_cash_flow_value,
+        watchlist.free_cash_flow_unit,
+        watchlist.price_history_status,
+        watchlist.fundamentals_status
+    FROM vw_mk_watchlist_analysis watchlist
+    LEFT JOIN vw_mk_current_quote quote
+        ON quote.security_key = watchlist.security_key
+    ORDER BY watchlist.ticker
 """
 
 MARKET_PRICE_HISTORY_SQL = """
@@ -129,6 +142,8 @@ def load_market_watchlist_data() -> pd.DataFrame:
     watchlist.columns = [column.lower() for column in watchlist.columns]
 
     for column in (
+        "provider_quote_at",
+        "quote_observed_at",
         "latest_trade_date",
         "latest_price_observed_at",
         "fundamentals_source_as_of_date",
@@ -188,12 +203,38 @@ def timestamp_text(value: object) -> str:
     return timestamp.strftime("%Y-%m-%d")
 
 
+def timestamp_with_time_text(value: object) -> str:
+    """Format an optional timestamp without asserting a provider timezone."""
+    timestamp = pd.to_datetime(value, errors="coerce")
+    if pd.isna(timestamp):
+        return "—"
+    return timestamp.strftime("%Y-%m-%d %H:%M")
+
+
 def market_price_age_days(latest_trade_date: object) -> int | None:
     """Return calendar-day age for the most recent stored market price."""
     timestamp = pd.to_datetime(latest_trade_date, errors="coerce")
     if pd.isna(timestamp):
         return None
     return (datetime.now(timezone.utc).date() - timestamp.date()).days
+
+
+def market_quote_age_hours(
+    oldest_quote_observed_at: object,
+    now: datetime | None = None,
+) -> float | None:
+    """Return elapsed UTC hours since the oldest current quote observation."""
+    timestamp = pd.to_datetime(oldest_quote_observed_at, errors="coerce", utc=True)
+    if pd.isna(timestamp):
+        return None
+
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+
+    return (now - timestamp.to_pydatetime()).total_seconds() / 3600
 
 
 def mortgage_payment(principal: float, annual_rate_pct: float, term_years: int) -> float:
@@ -467,11 +508,12 @@ def render_real_estate_dashboard() -> None:
 
 
 def render_market_watchlist_dashboard() -> None:
-    """Render canonical market research with explicit data-quality context."""
+    """Render current quote snapshots alongside historical market research."""
     st.header("Market Watchlist")
     st.caption(
-        "Historical market research data stored in the canonical Oracle market model. "
-        "This is an educational watchlist, not a personal holdings ledger or investment recommendation."
+        "Current quote snapshots and historical market research stored in the canonical "
+        "Oracle market model. This is an educational watchlist, not a personal holdings "
+        "ledger or investment recommendation."
     )
 
     try:
@@ -487,52 +529,89 @@ def render_market_watchlist_dashboard() -> None:
         st.info("No canonical market-watchlist securities are available yet.")
         return
 
-        oldest_latest_price_date = watchlist["latest_trade_date"].min()
-    newest_latest_price_date = watchlist["latest_trade_date"].max()
+    securities_with_current_quotes = int(watchlist["quote_snapshot_id"].notna().sum())
+    oldest_current_quote_observed_at = watchlist["quote_observed_at"].min()
+    newest_current_quote_observed_at = watchlist["quote_observed_at"].max()
+    quote_age_hours = market_quote_age_hours(oldest_current_quote_observed_at)
 
+    oldest_latest_price_date = watchlist["latest_trade_date"].min()
+    newest_latest_price_date = watchlist["latest_trade_date"].max()
     # Freshness is governed by the stalest security, not the most recently
     # refreshed ticker in the watchlist.
     price_age_days = market_price_age_days(oldest_latest_price_date)
-
-    securities_with_prices = int(
-        (watchlist["price_history_status"] == "PRICE_AVAILABLE").sum()
-    )
     securities_with_fundamentals = int(
         (watchlist["fundamentals_status"] != "MISSING_FUNDAMENTALS").sum()
     )
     fundamentals_coverage = securities_with_fundamentals / len(watchlist) * 100
 
-    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+    metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
     metric_1.metric("Watchlist securities", f"{len(watchlist):,}")
-    metric_2.metric("Securities with price history", f"{securities_with_prices:,}")
+    metric_2.metric(
+        "Current quotes",
+        f"{securities_with_current_quotes:,}/{len(watchlist):,}",
+    )
     metric_3.metric(
-        "Oldest latest price date",
+        "Oldest quote age",
+        "—" if quote_age_hours is None else f"{quote_age_hours:.1f} hours",
+    )
+    metric_4.metric(
+        "Historical price ending",
         timestamp_text(oldest_latest_price_date),
     )
-    metric_4.metric("Fundamentals coverage", f"{fundamentals_coverage:.2f}%")
+    metric_5.metric("Fundamentals coverage", f"{fundamentals_coverage:.2f}%")
+
+    if securities_with_current_quotes == 0:
+        st.error(
+            "No current quote snapshots are available. Do not interpret this watchlist as "
+            "showing current market prices."
+        )
+    elif securities_with_current_quotes < len(watchlist):
+        st.warning(
+            f"Current quote coverage is {securities_with_current_quotes} of {len(watchlist)} "
+            "securities. Blank quote values are unavailable, not zero."
+        )
+    elif quote_age_hours is None:
+        st.warning(
+            "Current quote snapshots exist, but their observation timestamps are unavailable."
+        )
+    elif quote_age_hours > 72:
+        st.warning(
+            f"Current quote coverage is complete, but the oldest quote snapshot is "
+            f"{quote_age_hours:.1f} hours old. Refresh quotes before using them as current context."
+        )
+    else:
+        st.success(
+            f"Current quote coverage is complete: {securities_with_current_quotes} of "
+            f"{len(watchlist)} securities. The oldest quote snapshot is "
+            f"{quote_age_hours:.1f} hours old."
+        )
 
     st.caption(
-        "Per-security latest-price dates range from "
+        "Current quote observation timestamps range from "
+        f"{timestamp_with_time_text(oldest_current_quote_observed_at)} through "
+        f"{timestamp_with_time_text(newest_current_quote_observed_at)}."
+    )
+
+    st.caption(
+        "Historical daily-price dates range from "
         f"{timestamp_text(oldest_latest_price_date)} through "
         f"{timestamp_text(newest_latest_price_date)}."
     )
 
     if price_age_days is None:
         st.error(
-            "No latest market-price date is available. Do not interpret the "
-            "watchlist as current market data."
+            "No latest market-price date is available. Do not interpret the watchlist as current market data."
         )
     elif price_age_days > 7:
-        st.error(
-            f"The oldest latest market price is {price_age_days} calendar days old. "
-            "The market data-quality gate currently fails its 7-day freshness "
-            "threshold, so do not treat displayed prices as live or use them for "
-            "time-sensitive decisions."
+        st.warning(
+            f"The historical daily-price series is {price_age_days} calendar days old. "
+            "It remains useful only as dated context for the table and trend chart below; "
+            "it does not replace the current quote snapshots above."
         )
     else:
         st.info(
-            f"The oldest latest stored market price is {price_age_days} calendar "
-            "day(s) old. They are historical reference data, not real-time quotes."
+            f"The oldest latest stored market price is {price_age_days} calendar day(s) old. "
+            "They are historical reference data, not real-time quotes."
         )
 
     if fundamentals_coverage < 25:
@@ -550,7 +629,9 @@ def render_market_watchlist_dashboard() -> None:
     with st.expander("How to interpret this market watchlist"):
         st.markdown(
             """
-            - **Latest close price** is the newest historical close stored in your database; it is not a live quote.
+            - **Current quote** is the latest provider quote snapshot captured by your pipeline. It is a point-in-time observation, not an execution price or trading recommendation.
+            - **Historical daily close** is the newest end-of-day close stored in your database. It remains historical reference data and must not be treated as a live quote.
+            - **Quote change** compares the provider's current quote with its prior close. It is not the same as your portfolio return.
             - **P/E, PEG, P/B, return on equity, and profit margin** are research metrics, not a recommendation or valuation model.
             - **Missing fundamentals** means the database has no imported value for that security. It does not imply poor quality.
             - **Free cash flow is intentionally not shown as currency** because the legacy source did not document its unit.
@@ -587,7 +668,65 @@ def render_market_watchlist_dashboard() -> None:
         st.warning("No securities match the selected watchlist filters.")
         return
 
-    st.subheader("Watchlist comparison")
+    st.subheader("Current quote snapshots")
+    st.caption(
+        "These values come from the latest successful Finnhub quote snapshot for each "
+        "security. They are displayed separately from historical daily close prices."
+    )
+    quote_comparison = filtered[
+        [
+            "ticker",
+            "sector_display",
+            "current_quote_price",
+            "quote_change_amount",
+            "quote_change_pct",
+            "quote_prior_close_price",
+            "quote_day_open_price",
+            "quote_day_high_price",
+            "quote_day_low_price",
+            "provider_quote_at",
+            "quote_observed_at",
+        ]
+    ].rename(
+        columns={
+            "ticker": "Ticker",
+            "sector_display": "Sector",
+            "current_quote_price": "Current quote",
+            "quote_change_amount": "Change",
+            "quote_change_pct": "Change %",
+            "quote_prior_close_price": "Prior close",
+            "quote_day_open_price": "Day open",
+            "quote_day_high_price": "Day high",
+            "quote_day_low_price": "Day low",
+            "provider_quote_at": "Provider quote time",
+            "quote_observed_at": "Observed by pipeline",
+        }
+    )
+    quote_comparison = quote_comparison.sort_values(by=["Sector", "Ticker"])
+    st.dataframe(
+        quote_comparison.style.format(
+            {
+                "Current quote": "${:,.2f}",
+                "Change": "${:,.2f}",
+                "Change %": "{:.2f}%",
+                "Prior close": "${:,.2f}",
+                "Day open": "${:,.2f}",
+                "Day high": "${:,.2f}",
+                "Day low": "${:,.2f}",
+                "Provider quote time": timestamp_with_time_text,
+                "Observed by pipeline": timestamp_with_time_text,
+            },
+            na_rep="—",
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.subheader("Historical daily-price and fundamentals comparison")
+    st.caption(
+        "The daily-close and fundamentals columns below are historical research data. "
+        "They are not substituted for the current quote snapshots above."
+    )
     comparison = filtered[
         [
             "ticker",
@@ -608,9 +747,9 @@ def render_market_watchlist_dashboard() -> None:
         columns={
             "ticker": "Ticker",
             "sector_display": "Sector",
-            "latest_close_price": "Latest close price",
-            "latest_trade_date": "Latest price date",
-            "latest_volume": "Latest volume",
+            "latest_close_price": "Historical daily close",
+            "latest_trade_date": "Historical close date",
+            "latest_volume": "Historical volume",
             "pe_ratio": "P/E ratio",
             "peg_ratio": "PEG ratio",
             "pb_ratio": "P/B ratio",
@@ -626,9 +765,9 @@ def render_market_watchlist_dashboard() -> None:
     st.dataframe(
         comparison.style.format(
             {
-                "Latest close price": "${:,.2f}",
-                "Latest price date": timestamp_text,
-                "Latest volume": "{:,.0f}",
+                "Historical daily close": "${:,.2f}",
+                "Historical close date": timestamp_text,
+                "Historical volume": "{:,.0f}",
                 "P/E ratio": "{:.2f}",
                 "PEG ratio": "{:.2f}",
                 "P/B ratio": "{:.2f}",
@@ -643,7 +782,7 @@ def render_market_watchlist_dashboard() -> None:
         use_container_width=True,
     )
 
-    st.subheader("Historical close-price trend")
+    st.subheader("Historical daily close-price trend")
     ticker_options = filtered["ticker"].tolist()
     selected_ticker = st.selectbox(
         "Choose a ticker",
@@ -664,14 +803,15 @@ def render_market_watchlist_dashboard() -> None:
 
     latest_price = chart_frame.iloc[-1]
     st.caption(
-        f"{selected_ticker}: {len(chart_frame):,} stored trading day(s), from "
+        f"{selected_ticker}: {len(chart_frame):,} stored historical trading day(s), from "
         f"{timestamp_text(chart_frame['trade_date'].min())} through "
-        f"{timestamp_text(chart_frame['trade_date'].max())}."
+        f"{timestamp_text(chart_frame['trade_date'].max())}. This chart does not update "
+        "when a current quote snapshot is loaded."
     )
     st.metric(
-        f"Latest stored {selected_ticker} close",
+        f"Historical {selected_ticker} daily close",
         money(latest_price["close_price"]),
-        help="This is the latest close stored in Oracle, not a live market quote.",
+        help="This is a historical daily close stored in Oracle, not a current quote.",
     )
     st.line_chart(
         chart_frame.set_index("trade_date")[["close_price"]].rename(

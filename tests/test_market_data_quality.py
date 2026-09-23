@@ -8,7 +8,9 @@ from portfolio_dashboard.data_quality import Severity, overall_status
 from portfolio_dashboard.market_data_quality import (
     MarketQualitySummary,
     MarketQualityThresholds,
+    evaluate_fundamentals_refresh_quality,
     evaluate_market_quality,
+    evaluate_price_refresh_quality,
     evaluate_quote_refresh_quality,
     price_age_in_days,
     quote_age_in_hours,
@@ -115,6 +117,62 @@ def test_quote_refresh_scope_still_fails_for_missing_quotes() -> None:
     )
 
     assert check_names(issues) == {"current_quote_coverage"}
+
+
+def test_price_refresh_scope_ignores_quote_and_fundamentals_lineage() -> None:
+    issues = evaluate_price_refresh_quality(
+        market_summary(
+            oldest_current_quote_observed_at=None,
+            newest_current_quote_observed_at=None,
+            securities_with_fundamentals=3,
+            securities_missing_fundamentals=41,
+            fundamentals_with_unknown_as_of_date=3,
+        ),
+        MarketQualityThresholds(max_price_age_days=7),
+        now=NOW,
+    )
+
+    assert issues == []
+
+
+def test_price_refresh_scope_fails_for_stale_or_duplicate_prices() -> None:
+    issues = evaluate_price_refresh_quality(
+        market_summary(
+            oldest_latest_price_date=date(2026, 9, 8),
+            newest_latest_price_date=date(2026, 9, 20),
+            duplicate_daily_price_groups=1,
+        ),
+        MarketQualityThresholds(max_price_age_days=7),
+        now=NOW,
+    )
+
+    assert check_names(issues) == {"daily_price_duplicates", "price_freshness"}
+
+
+def test_fundamentals_refresh_scope_ignores_price_and_quote_history_gaps() -> None:
+    issues = evaluate_fundamentals_refresh_quality(
+        market_summary(
+            oldest_current_quote_observed_at=None,
+            newest_current_quote_observed_at=None,
+            oldest_latest_price_date=date(2026, 9, 8),
+            newest_latest_price_date=date(2026, 9, 8),
+        ),
+        MarketQualityThresholds(min_fundamentals_coverage_pct=100),
+    )
+
+    assert issues == []
+
+
+def test_fundamentals_refresh_scope_fails_below_coverage_target() -> None:
+    issues = evaluate_fundamentals_refresh_quality(
+        market_summary(
+            securities_with_fundamentals=43,
+            securities_missing_fundamentals=1,
+        ),
+        MarketQualityThresholds(min_fundamentals_coverage_pct=100),
+    )
+
+    assert check_names(issues) == {"fundamentals_coverage"}
 
 
 def test_stale_prices_are_an_error() -> None:

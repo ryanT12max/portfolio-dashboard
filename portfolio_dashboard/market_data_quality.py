@@ -153,51 +153,13 @@ def _append_quote_refresh_issues(
         )
 
 
-def evaluate_quote_refresh_quality(
+def _append_price_refresh_issues(
+    issues: list[QualityIssue],
     summary: MarketQualitySummary,
     thresholds: MarketQualityThresholds,
-    now: datetime | None = None,
-) -> list[QualityIssue]:
-    """Evaluate only the daily quote-refresh service-level expectations.
-
-    Historical daily-price and fundamentals checks intentionally remain out of
-    this scope so a successful quote refresh is not misreported as failed by
-    known, separately governed legacy research data.
-    """
-    now = now or datetime.now(timezone.utc)
-    issues: list[QualityIssue] = []
-
-    if summary.total_watchlist_securities == 0:
-        issues.append(
-            QualityIssue(
-                Severity.ERROR,
-                "watchlist_population",
-                "No securities were found in the canonical market watchlist.",
-            )
-        )
-
-    _append_quote_refresh_issues(issues, summary, thresholds, now)
-    return issues
-
-
-def evaluate_market_quality(
-    summary: MarketQualitySummary,
-    thresholds: MarketQualityThresholds,
-    now: datetime | None = None,
-) -> list[QualityIssue]:
-    """Evaluate market quality without database access for unit testing."""
-    now = now or datetime.now(timezone.utc)
-    issues: list[QualityIssue] = []
-
-    if summary.total_watchlist_securities == 0:
-        issues.append(
-            QualityIssue(
-                Severity.ERROR,
-                "watchlist_population",
-                "No securities were found in the canonical market watchlist.",
-            )
-        )
-
+    now: datetime,
+) -> None:
+    """Append daily-price coverage, uniqueness, and freshness failures."""
     if summary.duplicate_daily_price_groups > 0:
         issues.append(
             QualityIssue(
@@ -207,8 +169,6 @@ def evaluate_market_quality(
                 "daily-price group(s) were found.",
             )
         )
-
-    _append_quote_refresh_issues(issues, summary, thresholds, now)
 
     coverage = summary.price_history_coverage_pct
     if coverage is not None and coverage < thresholds.min_price_history_coverage_pct:
@@ -245,6 +205,133 @@ def evaluate_market_quality(
                 f"{thresholds.max_price_age_days:.0f}-day threshold.",
             )
         )
+
+
+def evaluate_quote_refresh_quality(
+    summary: MarketQualitySummary,
+    thresholds: MarketQualityThresholds,
+    now: datetime | None = None,
+) -> list[QualityIssue]:
+    """Evaluate only the daily quote-refresh service-level expectations.
+
+    Historical daily-price and fundamentals checks intentionally remain out of
+    this scope so a successful quote refresh is not misreported as failed by
+    known, separately governed legacy research data.
+    """
+    now = now or datetime.now(timezone.utc)
+    issues: list[QualityIssue] = []
+
+    if summary.total_watchlist_securities == 0:
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "watchlist_population",
+                "No securities were found in the canonical market watchlist.",
+            )
+        )
+
+    _append_quote_refresh_issues(issues, summary, thresholds, now)
+    return issues
+
+
+def evaluate_fundamentals_refresh_quality(
+    summary: MarketQualitySummary,
+    thresholds: MarketQualityThresholds,
+) -> list[QualityIssue]:
+    """Evaluate only provider-fundamentals coverage and as-of-date lineage.
+
+    Price-history freshness and current-quote freshness are intentionally
+    outside this scope. A fundamentals enrichment must not be marked failed
+    solely because separately governed historical price data is stale.
+    """
+    issues: list[QualityIssue] = []
+
+    if summary.total_watchlist_securities == 0:
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "watchlist_population",
+                "No securities were found in the canonical market watchlist.",
+            )
+        )
+
+    fundamentals_coverage = summary.fundamentals_coverage_pct
+    if (
+        fundamentals_coverage is not None
+        and fundamentals_coverage < thresholds.min_fundamentals_coverage_pct
+    ):
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "fundamentals_coverage",
+                f"Fundamentals coverage is {fundamentals_coverage:.2f}%, below the "
+                f"configured {thresholds.min_fundamentals_coverage_pct:.2f}% target. "
+                f"{summary.securities_missing_fundamentals} security or securities "
+                "are missing a current canonical fundamentals snapshot.",
+            )
+        )
+
+    if summary.fundamentals_with_unknown_as_of_date > 0:
+        issues.append(
+            QualityIssue(
+                Severity.WARNING,
+                "fundamentals_as_of_date",
+                f"{summary.fundamentals_with_unknown_as_of_date} fundamental snapshot(s) "
+                "have no provider as-of date. Their retrieval timestamp is preserved, "
+                "but the dashboard must label the provider reporting date as unknown.",
+            )
+        )
+
+    return issues
+
+
+def evaluate_price_refresh_quality(
+    summary: MarketQualitySummary,
+    thresholds: MarketQualityThresholds,
+    now: datetime | None = None,
+) -> list[QualityIssue]:
+    """Evaluate only daily-price completeness, uniqueness, and freshness.
+
+    Current quotes and fundamentals are deliberately outside this scope. A
+    completed end-of-day price refresh must be evaluated on its own service
+    contract rather than on independently refreshed market datasets.
+    """
+    now = now or datetime.now(timezone.utc)
+    issues: list[QualityIssue] = []
+
+    if summary.total_watchlist_securities == 0:
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "watchlist_population",
+                "No securities were found in the canonical market watchlist.",
+            )
+        )
+
+    _append_price_refresh_issues(issues, summary, thresholds, now)
+    return issues
+
+
+def evaluate_market_quality(
+    summary: MarketQualitySummary,
+    thresholds: MarketQualityThresholds,
+    now: datetime | None = None,
+) -> list[QualityIssue]:
+    """Evaluate market quality without database access for unit testing."""
+    now = now or datetime.now(timezone.utc)
+    issues: list[QualityIssue] = []
+
+    if summary.total_watchlist_securities == 0:
+        issues.append(
+            QualityIssue(
+                Severity.ERROR,
+                "watchlist_population",
+                "No securities were found in the canonical market watchlist.",
+            )
+        )
+
+    _append_quote_refresh_issues(issues, summary, thresholds, now)
+    _append_price_refresh_issues(issues, summary, thresholds, now)
 
     fundamentals_coverage = summary.fundamentals_coverage_pct
     if (

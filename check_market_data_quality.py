@@ -18,7 +18,9 @@ from portfolio_dashboard.database import managed_connection
 from portfolio_dashboard.market_data_quality import (
     MarketQualitySummary,
     MarketQualityThresholds,
+    evaluate_fundamentals_refresh_quality,
     evaluate_market_quality,
+    evaluate_price_refresh_quality,
     evaluate_quote_refresh_quality,
 )
 
@@ -89,7 +91,12 @@ DAILY_PRICE_DUPLICATES_SQL = """
     )
 """
 
-QualityScope = Literal["full", "quote-refresh"]
+QualityScope = Literal[
+    "full",
+    "quote-refresh",
+    "price-refresh",
+    "fundamentals-refresh",
+]
 
 
 def _row_as_dict(cursor: oracledb.Cursor) -> dict[str, Any]:
@@ -169,7 +176,7 @@ def run_market_quality_check(
     scope: QualityScope = "full",
 ) -> tuple[MarketQualitySummary, list[QualityIssue]]:
     """Run one read-only quality scope and return its summary plus issues."""
-    if scope not in ("full", "quote-refresh"):
+    if scope not in ("full", "quote-refresh", "price-refresh", "fundamentals-refresh"):
         raise ValueError(f"Unsupported market quality scope: {scope}.")
 
     with managed_connection() as connection:
@@ -178,6 +185,10 @@ def run_market_quality_check(
 
     if scope == "quote-refresh":
         issues = evaluate_quote_refresh_quality(summary, thresholds)
+    elif scope == "price-refresh":
+        issues = evaluate_price_refresh_quality(summary, thresholds)
+    elif scope == "fundamentals-refresh":
+        issues = evaluate_fundamentals_refresh_quality(summary, thresholds)
     else:
         issues = evaluate_market_quality(summary, thresholds)
     return summary, issues
@@ -192,6 +203,12 @@ def print_report(
     if scope == "quote-refresh":
         print("MARKET QUOTE REFRESH QUALITY REPORT")
         print("Scope: current quote coverage and observation freshness only.")
+    elif scope == "price-refresh":
+        print("MARKET DAILY-PRICE REFRESH QUALITY REPORT")
+        print("Scope: historical daily-price coverage, uniqueness, and freshness only.")
+    elif scope == "fundamentals-refresh":
+        print("MARKET FUNDAMENTALS ENRICHMENT QUALITY REPORT")
+        print("Scope: fundamentals coverage and as-of-date lineage only.")
     else:
         print("MARKET WATCHLIST DATA QUALITY AND FRESHNESS REPORT")
     print()
@@ -240,6 +257,16 @@ def print_report(
                 "PASS: quote-refresh coverage and freshness checks passed. "
                 "Historical daily-price and fundamentals checks were not evaluated in this scope."
             )
+        elif scope == "price-refresh":
+            print(
+                "PASS: daily-price coverage, uniqueness, and freshness checks passed. "
+                "Current-quote and fundamentals checks were not evaluated in this scope."
+            )
+        elif scope == "fundamentals-refresh":
+            print(
+                "PASS: fundamentals coverage target was met. Historical daily-price "
+                "and current-quote checks were not evaluated in this scope."
+            )
         else:
             print("PASS: all configured market quality checks passed.")
         return
@@ -279,11 +306,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--scope",
-        choices=("full", "quote-refresh"),
+        choices=("full", "quote-refresh", "price-refresh", "fundamentals-refresh"),
         default="full",
         help=(
             "Quality gate to run: full evaluates all market data; quote-refresh evaluates "
-            "only current-quote coverage and freshness (default: full)."
+            "current-quote coverage and freshness; price-refresh evaluates daily-price "
+            "coverage, uniqueness, and freshness; fundamentals-refresh evaluates "
+            "fundamentals coverage and as-of-date lineage (default: full)."
         ),
     )
     parser.add_argument(

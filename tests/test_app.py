@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from app import MARKET_WATCHLIST_SQL, market_quote_age_hours, timestamp_with_time_text
+from app import (
+    CURRENT_LISTINGS_SQL,
+    MARKET_WATCHLIST_SQL,
+    market_quote_age_hours,
+    timestamp_with_time_text,
+)
 
 
 def test_market_quote_age_uses_elapsed_utc_hours() -> None:
@@ -26,3 +31,12 @@ def test_timestamp_with_time_text_omits_unverified_timezone_label() -> None:
     timestamp = datetime(2026, 9, 22, 19, 43, tzinfo=timezone.utc)
 
     assert timestamp_with_time_text(timestamp) == "2026-09-22 19:43"
+
+
+def test_real_estate_query_uses_scope_aware_investment_analysis_view() -> None:
+    normalized_sql = " ".join(CURRENT_LISTINGS_SQL.upper().split())
+
+    assert "FROM VW_RE_CURRENT_INVESTMENT_ANALYSIS" in normalized_sql
+    assert "ESTIMATE_SCOPE" in normalized_sql
+    assert "RENT_SUBJECT_ATTRIBUTE_MODE" in normalized_sql
+    assert "GROSS_YIELD_ELIGIBLE" in normalized_sql

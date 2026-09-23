@@ -32,14 +32,19 @@ CURRENT_LISTINGS_SQL = """
         year_built,
         latitude,
         longitude,
-        observed_at,
+        listing_observed_at AS observed_at,
         listing_date,
         last_seen_date,
         listing_status,
         asking_price,
-        est_monthly_rent,
-        gross_yield_pct
-    FROM vw_re_current_listing
+        estimated_monthly_rent AS est_monthly_rent,
+        estimate_scope,
+        rent_subject_attribute_mode,
+        rent_estimate_status,
+        gross_yield_eligible,
+        investment_analysis_status,
+        estimated_gross_yield_pct AS gross_yield_pct
+    FROM vw_re_current_investment_analysis
     WHERE listing_status = 'Active' OR listing_status IS NULL
     ORDER BY observed_at DESC, asking_price ASC
 """
@@ -274,7 +279,15 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
     selected = lookup.loc[selected_key]
 
     suggested_rent = selected["est_monthly_rent"]
-    rent_default = float(suggested_rent) if pd.notna(suggested_rent) else 0.0
+    unit_scope_estimate = selected.get("estimate_scope") == "UNIT"
+    provider_attribute_lookup = (
+        selected.get("rent_subject_attribute_mode") == "PROVIDER_LOOKUP"
+    )
+    rent_default = (
+        float(suggested_rent)
+        if pd.notna(suggested_rent) and not unit_scope_estimate
+        else 0.0
+    )
 
     assumptions, results = st.columns(2)
 
@@ -291,7 +304,10 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
             min_value=0.0,
             value=rent_default,
             step=100.0,
-            help="RentCast sale listings may not include an estimated rent. Enter your own assumption when needed.",
+            help=(
+                "Property-level RentCast estimates are used as a starting point. "
+                "Enter your own whole-property assumption when needed."
+            ),
         )
         down_payment_pct = st.slider("Down payment (%)", 0, 100, 20, 5)
         interest_rate_pct = st.number_input(
@@ -344,7 +360,19 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
         metric_right.metric("Estimated monthly cash flow", money(estimated_cash_flow))
         st.metric("Estimated cap rate", percent(cap_rate))
 
-    if monthly_rent == 0:
+    if unit_scope_estimate:
+        st.warning(
+            "RentCast returned a single-unit estimate for this Multi-Family listing. "
+            "It was not prefilled because it is not whole-building income. Enter a "
+            "separately verified whole-property rent assumption before using this calculator."
+        )
+    if provider_attribute_lookup:
+        st.info(
+            "RentCast looked up the subject-property attributes from the address because "
+            "this listing is missing one or more internal attributes. Verify the provider "
+            "attributes before relying on this estimate."
+        )
+    elif not unit_scope_estimate and monthly_rent == 0:
         st.info("Enter a monthly rent assumption to evaluate cash flow and cap rate.")
 
     st.caption(
@@ -413,6 +441,11 @@ def render_real_estate_dashboard() -> None:
         return
 
     rent_coverage_count = int(filtered["est_monthly_rent"].notna().sum())
+    property_scope_count = int((filtered["estimate_scope"] == "PROPERTY").sum())
+    unit_scope_count = int((filtered["estimate_scope"] == "UNIT").sum())
+    gross_yield_eligible_count = int(
+        (filtered["gross_yield_eligible"] == "Y").sum()
+    )
     median_yield = filtered["gross_yield_pct"].median()
     newest_observation = filtered["observed_at"].max()
 
@@ -420,7 +453,17 @@ def render_real_estate_dashboard() -> None:
     metric_1.metric("Listings shown", f"{len(filtered):,}")
     metric_2.metric("Median asking price", money(filtered["asking_price"].median()))
     metric_3.metric("Listings with rent estimate", f"{rent_coverage_count:,}")
-    metric_4.metric("Median gross yield", percent(median_yield))
+    metric_4.metric(
+        "Gross-yield eligible",
+        f"{gross_yield_eligible_count:,}/{len(filtered):,}",
+        help="Only PROPERTY-scope rent estimates can support whole-property gross yield.",
+    )
+
+    st.caption(
+        f"Rent estimate scope: {property_scope_count:,} whole-property estimate(s), "
+        f"{unit_scope_count:,} single-unit estimate(s). Median gross yield "
+        f"({percent(median_yield)}) uses whole-property estimates only."
+    )
 
     if not latest_run.empty:
         run = latest_run.iloc[0]
@@ -444,8 +487,10 @@ def render_real_estate_dashboard() -> None:
         st.markdown(
             """
             - **Asking price** is the seller's list price, not an appraisal or final sale price.
-            - **Gross yield** is `(estimated monthly rent × 12) ÷ asking price`. It excludes operating and financing costs.
-            - **Listings with rent estimate** identifies rows with source rent data. A blank rent is unknown, not zero.
+            - **Whole-property rent estimate** can support the displayed gross-yield calculation: `(estimated monthly rent × 12) ÷ asking price`. It excludes operating and financing costs.
+            - **Single-unit rent estimate** is RentCast's value for one unit in a Multi-Family listing. It is displayed for research, but it is never used as whole-building income or gross yield.
+            - **Provider address lookup** means the listing was missing one or more internal attributes, so RentCast looked up the subject property from its address. It is still an estimate, not a substitute for verifying the listing facts.
+            - **Listings with rent estimate** identifies rows with provider rent data. A blank rent is unknown, not zero; **Unavailable** means the provider was tried but produced no usable estimate.
             - Use the scenario calculator for a first-pass underwriting exercise, then verify each assumption independently.
             """
         )
@@ -460,6 +505,9 @@ def render_real_estate_dashboard() -> None:
         "structure_sqft",
         "asking_price",
         "est_monthly_rent",
+        "estimate_scope",
+        "rent_subject_attribute_mode",
+        "rent_estimate_status",
         "gross_yield_pct",
         "observed_at",
     ]
@@ -473,6 +521,9 @@ def render_real_estate_dashboard() -> None:
             "structure_sqft": "Square feet",
             "asking_price": "Asking price",
             "est_monthly_rent": "Monthly rent",
+            "estimate_scope": "Rent scope",
+            "rent_subject_attribute_mode": "Rent input profile",
+            "rent_estimate_status": "Rent status",
             "gross_yield_pct": "Gross yield",
             "observed_at": "Observed at",
         }

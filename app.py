@@ -258,9 +258,362 @@ def mortgage_payment(principal: float, annual_rate_pct: float, term_years: int) 
     ) / ((1 + monthly_rate) ** payment_count - 1)
 
 
+MAP_DEFAULT_COLOR = [33, 113, 181, 150]
+MAP_SELECTED_COLOR = [230, 126, 34, 255]
+MAP_DEFAULT_RADIUS_METERS = 180
+MAP_SELECTED_RADIUS_METERS = 360
+
+FUNDAMENTAL_METRIC_GROUPS = {
+    "Valuation": (
+        ("P/E ratio", "pe_ratio", "number"),
+        ("PEG ratio", "peg_ratio", "number"),
+        ("P/B ratio", "pb_ratio", "number"),
+    ),
+    "Profitability & efficiency": (
+        ("EPS", "earnings_per_share", "number"),
+        ("Return on equity", "return_on_equity_pct", "percent"),
+        ("Profit margin", "profit_margin_pct", "percent"),
+    ),
+    "Financial health & solvency": (
+        ("Debt-to-equity", "debt_to_equity_ratio", "number"),
+        ("Free cash flow", "free_cash_flow_value", "number"),
+    ),
+}
+
+
+def selected_property_key_from_rows(
+    table: pd.DataFrame,
+    selected_rows: list[int],
+) -> int | None:
+    """Return one selected property key while safely handling a stale table event."""
+    if not selected_rows:
+        return None
+
+    selected_index = selected_rows[0]
+    if selected_index < 0 or selected_index >= len(table):
+        return None
+
+    property_key = table.iloc[selected_index].get("Property key")
+    if property_key is None or pd.isna(property_key):
+        return None
+    return int(property_key)
+
+
+def build_listing_map_frame(
+    listings: pd.DataFrame,
+    selected_property_key: int | None,
+) -> pd.DataFrame:
+    """Build a clean map frame with one distinct marker for a selected listing."""
+    map_frame = listings.dropna(subset=["latitude", "longitude"]).copy()
+    if map_frame.empty:
+        return map_frame
+
+    map_frame["marker_color"] = map_frame["property_key"].apply(
+        lambda property_key: (
+            MAP_SELECTED_COLOR
+            if selected_property_key == int(property_key)
+            else MAP_DEFAULT_COLOR
+        )
+    )
+    map_frame["marker_radius"] = map_frame["property_key"].apply(
+        lambda property_key: (
+            MAP_SELECTED_RADIUS_METERS
+            if selected_property_key == int(property_key)
+            else MAP_DEFAULT_RADIUS_METERS
+        )
+    )
+    return map_frame
+
+
+def render_listing_map(
+    listings: pd.DataFrame,
+    selected_property_key: int | None,
+) -> None:
+    """Render location markers and focus the selected table row when available."""
+    map_frame = build_listing_map_frame(listings, selected_property_key)
+    if map_frame.empty:
+        return
+
+    try:
+        import pydeck as pdk
+    except ImportError:
+        st.warning("Interactive map highlighting is unavailable in this environment.")
+        return
+
+    selected_row = map_frame[map_frame["property_key"] == selected_property_key]
+    if selected_row.empty:
+        center_latitude = float(map_frame["latitude"].mean())
+        center_longitude = float(map_frame["longitude"].mean())
+        zoom = 10.5
+    else:
+        center_latitude = float(selected_row.iloc[0]["latitude"])
+        center_longitude = float(selected_row.iloc[0]["longitude"])
+        zoom = 14
+
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=map_frame,
+        get_position="[longitude, latitude]",
+        get_fill_color="marker_color",
+        get_radius="marker_radius",
+        pickable=True,
+        stroked=True,
+        get_line_color=[255, 255, 255, 220],
+        line_width_min_pixels=1,
+    )
+    deck = pdk.Deck(
+        layers=[layer],
+        initial_view_state=pdk.ViewState(
+            latitude=center_latitude,
+            longitude=center_longitude,
+            zoom=zoom,
+            pitch=0,
+        ),
+        tooltip={
+            "html": (
+                "<b>{street_address}</b><br/>"
+                "Asking price: ${asking_price}<br/>"
+                "Type: {property_type}"
+            ),
+            "style": {"backgroundColor": "#1f2937", "color": "white"},
+        },
+    )
+    st.pydeck_chart(deck, use_container_width=True)
+
+
+def build_fundamentals_explorer_frame(
+    watchlist: pd.DataFrame,
+    metric_group: str,
+    sort_column: str,
+    ascending: bool,
+    hide_missing_metrics: bool,
+    show_lineage: bool,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Create one clean, category-sized fundamentals table for every security."""
+    metric_definitions = FUNDAMENTAL_METRIC_GROUPS[metric_group]
+    metric_columns = [column for _, column, _ in metric_definitions]
+    metric_labels = {column: label for label, column, _ in metric_definitions}
+
+    frame = watchlist.copy()
+    frame["sector_display"] = frame["sector"].fillna("Unclassified")
+    if hide_missing_metrics:
+        frame = frame[frame[metric_columns].notna().any(axis=1)].copy()
+
+    display_columns = ["ticker", "sector_display", *metric_columns]
+    rename_columns = {
+        "ticker": "Ticker",
+        "sector_display": "Sector",
+        **metric_labels,
+    }
+
+    if metric_group == "Financial health & solvency":
+        display_columns.append("free_cash_flow_unit")
+        rename_columns["free_cash_flow_unit"] = "FCF unit"
+
+    if show_lineage:
+        display_columns.extend(
+            [
+                "fundamentals_source",
+                "fundamentals_source_as_of_date",
+                "fundamentals_observed_at",
+            ]
+        )
+        rename_columns.update(
+            {
+                "fundamentals_source": "Source",
+                "fundamentals_source_as_of_date": "Provider as-of date",
+                "fundamentals_observed_at": "Retrieved by pipeline",
+            }
+        )
+
+    display = frame[display_columns].sort_values(
+        by=sort_column,
+        ascending=ascending,
+        na_position="last",
+    )
+    return display.rename(columns=rename_columns), metric_labels
+
+
+def render_metric_dictionary() -> None:
+    """Render novice-friendly metric definitions without generating buy/sell signals."""
+    with st.expander("📖 Fundamental Metric Dictionary"):
+        st.info(
+            "🟢 means a pattern investors often view favorably after comparing similar "
+            "companies. 🔴 means a potential caution or research question. Neither icon "
+            "means buy, sell, safe, or unsafe by itself."
+        )
+
+        valuation_tab, profitability_tab, health_tab = st.tabs(
+            [
+                "💲 Valuation",
+                "📈 Profitability & efficiency",
+                "🛡️ Financial health & solvency",
+            ]
+        )
+
+        with valuation_tab:
+            st.markdown(
+                """
+                **Price-to-Earnings (P/E) ratio**
+
+                - **What it means:** the share price divided by earnings per share. In plain English, it approximates how much investors are paying for each $1 of a company's earnings.
+                - 🟢 **Lower than similar companies or its own history:** can suggest investors are paying less for current earnings.
+                - 🔴 **Higher than similar companies or its own history:** can suggest investors are paying more for current earnings and expecting more growth.
+                - **How investors use it:** as a valuation comparison within the same industry. A low P/E is not automatically a bargain; weak or falling earnings can also make it low.
+
+                **PEG ratio (Price/Earnings-to-Growth)**
+
+                - **What it means:** a P/E ratio viewed alongside expected earnings growth. It asks whether the price paid for earnings is high or low relative to expected growth.
+                - 🟢 **Lower relative to comparable companies:** can suggest the price is lower relative to the growth assumption.
+                - 🔴 **Higher relative to comparable companies:** can suggest investors are paying more for each unit of expected growth.
+                - **How investors use it:** to add a growth lens to P/E. It depends on growth forecasts, which can be wrong, so it is not a stand-alone buy signal.
+
+                **Price-to-Book (P/B) ratio**
+
+                - **What it means:** the share price divided by book value per share, where book value is accounting equity after liabilities.
+                - 🟢 **Lower relative to peers:** can suggest the market price is low compared with recorded net assets.
+                - 🔴 **Higher relative to peers:** can suggest investors value the business well above recorded net assets.
+                - **How investors use it:** often for asset-heavy businesses. It can be much less useful for companies whose value comes mainly from brands, software, or other intangible assets.
+                """
+            )
+
+        with profitability_tab:
+            st.markdown(
+                """
+                **Earnings Per Share (EPS)**
+
+                - **What it means:** company profit allocated per common share.
+                - 🟢 **Higher or consistently growing EPS:** can indicate improving profits on a per-share basis.
+                - 🔴 **Low, negative, or falling EPS:** can indicate losses, slowing profits, or more shares reducing the profit attributable to each share.
+                - **How investors use it:** to study earnings trends and calculate valuation measures such as P/E; the direction and quality of earnings matter as much as one number.
+
+                **Return on Equity (ROE)**
+
+                - **What it means:** net income divided by shareholder equity. It shows how much profit a company generates from owners' invested capital.
+                - 🟢 **Higher and sustainable compared with peers:** can indicate efficient use of shareholder capital.
+                - 🔴 **Low or falling compared with peers:** can indicate weak profitability or inefficient use of equity.
+                - **Important caution:** an unusually high ROE can be caused by very low equity or high debt, so investors check debt levels too.
+
+                **Profit Margin**
+
+                - **What it means:** the percentage of revenue that remains as profit after expenses.
+                - 🟢 **Higher or stable versus peers:** can suggest stronger pricing power, cost control, or a more profitable business model.
+                - 🔴 **Lower or declining versus peers:** can suggest rising costs, competition, or weaker profitability.
+                - **How investors use it:** to compare operating performance among companies with similar business models; normal margins differ greatly by industry.
+                """
+            )
+
+        with health_tab:
+            st.markdown(
+                """
+                **Debt-to-Equity (D/E) ratio**
+
+                - **What it means:** debt compared with shareholder equity. It is a quick view of how much a company relies on borrowing.
+                - 🟢 **Lower relative to similar companies:** often means less leverage and potentially less debt-related financial pressure.
+                - 🔴 **Higher relative to similar companies:** can mean more leverage and greater sensitivity to interest costs or weaker earnings.
+                - **How investors use it:** to assess balance-sheet risk alongside cash flow and interest coverage. Banks, utilities, and REITs can normally carry more debt than other industries.
+
+                **Free Cash Flow (FCF)**
+
+                - **What it means:** cash remaining after a company funds normal operations and the long-term investments needed to run the business.
+                - 🟢 **Positive and consistently growing FCF:** can suggest the business is generating cash that may support debt repayment, reinvestment, dividends, or share repurchases.
+                - 🔴 **Negative or shrinking FCF:** can be a caution, but it can also reflect a company deliberately investing for future growth.
+                - **How investors use it:** to assess cash-generation quality and whether reported profit is turning into cash. Compare trends and size-adjusted measures; raw FCF dollars are not directly comparable across companies of different sizes.
+                """
+            )
+
+        st.caption(
+            "Use these metrics as a research checklist: compare the same industry, review "
+            "multi-period trends and company filings, and consider your goals and risk "
+            "tolerance. The dashboard does not produce buy or sell recommendations."
+        )
+
+
+def render_fundamentals_explorer(watchlist: pd.DataFrame) -> None:
+    """Render every watchlist security through a compact category-level metric lens."""
+    st.subheader("📊 Fundamentals Explorer")
+    st.caption(
+        "Choose one metric group to compare every watchlist security without a wide, "
+        "hard-to-read table. Missing values are unknown, not zero."
+    )
+
+    metric_group = st.radio(
+        "Metric group",
+        options=list(FUNDAMENTAL_METRIC_GROUPS),
+        horizontal=True,
+        key="fundamentals_metric_group",
+    )
+    metric_definitions = FUNDAMENTAL_METRIC_GROUPS[metric_group]
+    metric_labels = [label for label, _, _ in metric_definitions]
+    label_to_column = {label: column for label, column, _ in metric_definitions}
+
+    control_left, control_middle, control_right = st.columns(3)
+    with control_left:
+        sort_label = st.selectbox(
+            "Sort by",
+            options=metric_labels,
+            key="fundamentals_sort_metric",
+        )
+    with control_middle:
+        sort_direction = st.radio(
+            "Sort direction",
+            options=("Low to high", "High to low"),
+            horizontal=True,
+            key="fundamentals_sort_direction",
+        )
+    with control_right:
+        hide_missing_metrics = st.checkbox(
+            "Hide stocks with no values in this group",
+            value=False,
+            key="fundamentals_hide_missing",
+        )
+
+    show_lineage = st.checkbox(
+        "Show data source and dates",
+        value=False,
+        key="fundamentals_show_lineage",
+        help="Shows provider lineage without crowding the default comparison view.",
+    )
+    explorer, _ = build_fundamentals_explorer_frame(
+        watchlist,
+        metric_group=metric_group,
+        sort_column=label_to_column[sort_label],
+        ascending=sort_direction == "Low to high",
+        hide_missing_metrics=hide_missing_metrics,
+        show_lineage=show_lineage,
+    )
+
+    if explorer.empty:
+        st.info("No securities have a value for the selected fundamentals filter.")
+        return
+
+    format_rules = {
+        "P/E ratio": "{:.2f}",
+        "PEG ratio": "{:.2f}",
+        "P/B ratio": "{:.2f}",
+        "EPS": "{:.2f}",
+        "Return on equity": "{:.2f}%",
+        "Profit margin": "{:.2f}%",
+        "Debt-to-equity": "{:.2f}",
+        "Free cash flow": "{:.2f}",
+        "Provider as-of date": timestamp_text,
+        "Retrieved by pipeline": timestamp_with_time_text,
+    }
+    st.dataframe(
+        explorer.style.format(format_rules, na_rep="—"),
+        hide_index=True,
+        use_container_width=True,
+    )
+    if metric_group == "Financial health & solvency":
+        st.caption(
+            "Free cash flow is shown only with the provider's recorded unit. Do not treat "
+            "it as dollars or compare it across providers when the unit is unknown."
+        )
+
+
 def render_scenario_calculator(listings: pd.DataFrame) -> None:
     """Render an assumption-driven underwriting scenario for one listing."""
-    st.subheader("Investment Scenario Calculator")
+    st.subheader("🧮 Investment Scenario Calculator")
     st.caption(
         "This is a planning tool, not an appraisal, lending quote, or investment recommendation."
     )
@@ -292,7 +645,7 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
     assumptions, results = st.columns(2)
 
     with assumptions:
-        st.markdown("#### Assumptions")
+        st.markdown("#### 🧾 Assumptions")
         purchase_price = st.number_input(
             "Purchase price",
             min_value=0.0,
@@ -320,7 +673,7 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
         loan_term_years = st.selectbox("Loan term (years)", (15, 20, 30), index=2)
 
     with results:
-        st.markdown("#### Scenario results")
+        st.markdown("#### 📊 Scenario results")
         down_payment = purchase_price * down_payment_pct / 100
         principal = purchase_price - down_payment
         monthly_pi = mortgage_payment(principal, interest_rate_pct, loan_term_years)
@@ -383,7 +736,7 @@ def render_scenario_calculator(listings: pd.DataFrame) -> None:
 
 def render_real_estate_dashboard() -> None:
     """Render the existing real-estate opportunity analysis section."""
-    st.header("Houston Real Estate Opportunities")
+    st.header("🏠 Houston Real Estate Opportunities")
     st.caption(
         "Current active RentCast listings stored and audited in Oracle Autonomous Database."
     )
@@ -440,7 +793,6 @@ def render_real_estate_dashboard() -> None:
         st.warning("No listings match the current filters. Adjust the filters above.")
         return
 
-    rent_coverage_count = int(filtered["est_monthly_rent"].notna().sum())
     property_scope_count = int((filtered["estimate_scope"] == "PROPERTY").sum())
     unit_scope_count = int((filtered["estimate_scope"] == "UNIT").sum())
     gross_yield_eligible_count = int(
@@ -449,12 +801,11 @@ def render_real_estate_dashboard() -> None:
     median_yield = filtered["gross_yield_pct"].median()
     newest_observation = filtered["observed_at"].max()
 
-    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
-    metric_1.metric("Listings shown", f"{len(filtered):,}")
-    metric_2.metric("Median asking price", money(filtered["asking_price"].median()))
-    metric_3.metric("Listings with rent estimate", f"{rent_coverage_count:,}")
-    metric_4.metric(
-        "Gross-yield eligible",
+    metric_1, metric_2, metric_3 = st.columns(3)
+    metric_1.metric("📋 Listings shown", f"{len(filtered):,}")
+    metric_2.metric("💰 Median asking price", money(filtered["asking_price"].median()))
+    metric_3.metric(
+        "🏡 Gross-yield eligible",
         f"{gross_yield_eligible_count:,}/{len(filtered):,}",
         help="Only PROPERTY-scope rent estimates can support whole-property gross yield.",
     )
@@ -487,16 +838,28 @@ def render_real_estate_dashboard() -> None:
         st.markdown(
             """
             - **Asking price** is the seller's list price, not an appraisal or final sale price.
-            - **Whole-property rent estimate** can support the displayed gross-yield calculation: `(estimated monthly rent × 12) ÷ asking price`. It excludes operating and financing costs.
             - **Single-unit rent estimate** is RentCast's value for one unit in a Multi-Family listing. It is displayed for research, but it is never used as whole-building income or gross yield.
-            - **Provider address lookup** means the listing was missing one or more internal attributes, so RentCast looked up the subject property from its address. It is still an estimate, not a substitute for verifying the listing facts.
-            - **Listings with rent estimate** identifies rows with provider rent data. A blank rent is unknown, not zero; **Unavailable** means the provider was tried but produced no usable estimate.
-            - Use the scenario calculator for a first-pass underwriting exercise, then verify each assumption independently.
+
+            #### 💵 Cost and financing assumptions
+
+            - **Property-tax assumption** is a yearly percentage used for a quick estimate: `purchase price × tax percentage`. The dashboard divides that annual estimate by 12 for the monthly budget. For a real property, start with the county tax record or a tax professional; the assessed value and your exemptions may differ from the purchase price.
+            - **Annual insurance assumption** is your estimated total property-insurance cost for one year. Enter a lender or insurer quote when possible; the dashboard divides it by 12 to budget a monthly amount.
+            - **Annual interest rate** is the loan interest rate quoted by a lender. The dashboard converts it to a monthly rate when calculating the loan payment. It is an input, not a rate calculated from the listing, and it can change with credit, down payment, loan type, and market conditions.
+            - **Maintenance reserve** is money set aside each month for expected repairs and replacements, such as plumbing fixes, appliances, or paint. The dashboard estimates it as a percentage of monthly rent; it is a planned budget, not a bill that has already happened.
+            - **Vacancy reserve** is money set aside for periods when the property earns no rent, such as tenant turnover or marketing time. The dashboard estimates it as a percentage of monthly rent.
+
+            #### 📈 Results shown by the scenario calculator
+
+            - **Principal and interest** is the monthly loan payment that pays down the amount borrowed (**principal**) and the lender's charge for borrowing it (**interest**). Property tax and insurance are calculated separately in this dashboard.
+            - **Estimated cap rate** is the property's estimated annual operating income before mortgage payments, divided by its purchase price: `(annual rent − annual operating costs) ÷ purchase price`. A cap rate helps compare properties, but it does not include financing or every possible expense.
+            - **Estimated monthly cash flow** is the rent left after the dashboard subtracts principal and interest, property tax, insurance, maintenance reserve, and vacancy reserve. A positive result is not guaranteed profit because expenses such as HOA fees, utilities, management, repairs beyond the reserve, closing costs, and income taxes are not included.
             """
         )
 
-    st.subheader("Current listings")
+    st.subheader("📋 Current listings")
+    st.caption("🖱️ Select one row to center the map and highlight that property marker.")
     table_columns = [
+        "property_key",
         "street_address",
         "city",
         "property_type",
@@ -506,13 +869,12 @@ def render_real_estate_dashboard() -> None:
         "asking_price",
         "est_monthly_rent",
         "estimate_scope",
-        "rent_subject_attribute_mode",
-        "rent_estimate_status",
         "gross_yield_pct",
         "observed_at",
     ]
     table = filtered[table_columns].rename(
         columns={
+            "property_key": "Property key",
             "street_address": "Address",
             "city": "City",
             "property_type": "Type",
@@ -522,13 +884,11 @@ def render_real_estate_dashboard() -> None:
             "asking_price": "Asking price",
             "est_monthly_rent": "Monthly rent",
             "estimate_scope": "Rent scope",
-            "rent_subject_attribute_mode": "Rent input profile",
-            "rent_estimate_status": "Rent status",
             "gross_yield_pct": "Gross yield",
             "observed_at": "Observed at",
         }
     )
-    st.dataframe(
+    table_event = st.dataframe(
         table.style.format(
             {
                 "Beds": "{:.1f}",
@@ -543,16 +903,19 @@ def render_real_estate_dashboard() -> None:
         ),
         hide_index=True,
         use_container_width=True,
+        column_config={"Property key": None},
+        on_select="rerun",
+        selection_mode="single-row",
+        key="current_listings_table",
+    )
+    selected_property_key = selected_property_key_from_rows(
+        table,
+        list(table_event.selection.rows),
     )
 
-    map_frame = filtered.dropna(subset=["latitude", "longitude"]).copy()
-    if not map_frame.empty:
+    if not filtered.dropna(subset=["latitude", "longitude"]).empty:
         st.subheader("Listing locations")
-        st.map(
-            map_frame.rename(columns={"latitude": "lat", "longitude": "lon"}),
-            latitude="lat",
-            longitude="lon",
-        )
+        render_listing_map(filtered, selected_property_key)
 
     st.divider()
     render_scenario_calculator(filtered)
@@ -560,7 +923,7 @@ def render_real_estate_dashboard() -> None:
 
 def render_market_watchlist_dashboard() -> None:
     """Render current quote snapshots alongside historical market research."""
-    st.header("Market Watchlist")
+    st.header("📈 Market Watchlist")
     st.caption(
         "Current quote snapshots and historical market research stored in the canonical "
         "Oracle market model. This is an educational watchlist, not a personal holdings "
@@ -596,20 +959,20 @@ def render_market_watchlist_dashboard() -> None:
     fundamentals_coverage = securities_with_fundamentals / len(watchlist) * 100
 
     metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
-    metric_1.metric("Watchlist securities", f"{len(watchlist):,}")
+    metric_1.metric("🔎 Watchlist securities", f"{len(watchlist):,}")
     metric_2.metric(
-        "Current quotes",
+        "💬 Current quotes",
         f"{securities_with_current_quotes:,}/{len(watchlist):,}",
     )
     metric_3.metric(
-        "Oldest quote age",
+        "⏱️ Oldest quote age",
         "—" if quote_age_hours is None else f"{quote_age_hours:.1f} hours",
     )
     metric_4.metric(
-        "Historical price ending",
+        "🗓️ Historical price ending",
         timestamp_text(oldest_latest_price_date),
     )
-    metric_5.metric("Fundamentals coverage", f"{fundamentals_coverage:.2f}%")
+    metric_5.metric("📚 Fundamentals coverage", f"{fundamentals_coverage:.2f}%")
 
     if securities_with_current_quotes == 0:
         st.error(
@@ -677,18 +1040,7 @@ def render_market_watchlist_dashboard() -> None:
             "as legacy historical context rather than current company financials."
         )
 
-    with st.expander("How to interpret this market watchlist"):
-        st.markdown(
-            """
-            - **Current quote** is the latest provider quote snapshot captured by your pipeline. It is a point-in-time observation, not an execution price or trading recommendation.
-            - **Historical daily close** is the newest end-of-day close stored in your database. It remains historical reference data and must not be treated as a live quote.
-            - **Quote change** compares the provider's current quote with its prior close. It is not the same as your portfolio return.
-            - **P/E, PEG, P/B, return on equity, and profit margin** are research metrics, not a recommendation or valuation model.
-            - **Missing fundamentals** means the database has no imported value for that security. It does not imply poor quality.
-            - **Free cash flow is intentionally not shown as currency** because the legacy source did not document its unit.
-            - This watchlist does not represent stocks you own. Personal holdings and cost basis will be added later through a separate portfolio-ledger model.
-            """
-        )
+    render_metric_dictionary()
 
     filter_left, filter_right = st.columns(2)
     display_frame = watchlist.copy()
@@ -719,7 +1071,7 @@ def render_market_watchlist_dashboard() -> None:
         st.warning("No securities match the selected watchlist filters.")
         return
 
-    st.subheader("Current quote snapshots")
+    st.subheader("💬 Current quote snapshots")
     st.caption(
         "These values come from the latest successful Finnhub quote snapshot for each "
         "security. They are displayed separately from historical daily close prices."
@@ -773,67 +1125,9 @@ def render_market_watchlist_dashboard() -> None:
         use_container_width=True,
     )
 
-    st.subheader("Historical daily-price and fundamentals comparison")
-    st.caption(
-        "The daily-close and fundamentals columns below are historical research data. "
-        "They are not substituted for the current quote snapshots above."
-    )
-    comparison = filtered[
-        [
-            "ticker",
-            "sector_display",
-            "latest_close_price",
-            "latest_trade_date",
-            "latest_volume",
-            "pe_ratio",
-            "peg_ratio",
-            "pb_ratio",
-            "earnings_per_share",
-            "return_on_equity_pct",
-            "profit_margin_pct",
-            "debt_to_equity_ratio",
-            "fundamentals_status",
-        ]
-    ].rename(
-        columns={
-            "ticker": "Ticker",
-            "sector_display": "Sector",
-            "latest_close_price": "Historical daily close",
-            "latest_trade_date": "Historical close date",
-            "latest_volume": "Historical volume",
-            "pe_ratio": "P/E ratio",
-            "peg_ratio": "PEG ratio",
-            "pb_ratio": "P/B ratio",
-            "earnings_per_share": "EPS",
-            "return_on_equity_pct": "Return on equity",
-            "profit_margin_pct": "Profit margin",
-            "debt_to_equity_ratio": "Debt-to-equity",
-            "fundamentals_status": "Fundamentals status",
-        }
-    )
-    comparison = comparison.sort_values(by=["Sector", "Ticker"])
+    render_fundamentals_explorer(filtered)
 
-    st.dataframe(
-        comparison.style.format(
-            {
-                "Historical daily close": "${:,.2f}",
-                "Historical close date": timestamp_text,
-                "Historical volume": "{:,.0f}",
-                "P/E ratio": "{:.2f}",
-                "PEG ratio": "{:.2f}",
-                "P/B ratio": "{:.2f}",
-                "EPS": "{:.2f}",
-                "Return on equity": "{:.2f}%",
-                "Profit margin": "{:.2f}%",
-                "Debt-to-equity": "{:.2f}",
-            },
-            na_rep="—",
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
-
-    st.subheader("Historical daily close-price trend")
+    st.subheader("📉 Historical daily close-price trend")
     ticker_options = filtered["ticker"].tolist()
     selected_ticker = st.selectbox(
         "Choose a ticker",

@@ -140,7 +140,13 @@ MARKET_WATCHLIST_SQL = """
 
         watchlist.ticker,
 
+        watchlist.security_name,
+
         watchlist.sector,
+
+        watchlist.security_reference_source,
+
+        watchlist.security_reference_observed_at,
 
         quote.quote_snapshot_id,
 
@@ -315,6 +321,8 @@ def load_market_watchlist_data() -> pd.DataFrame:
 
         "fundamentals_observed_at",
 
+        "security_reference_observed_at",
+
     ):
 
         if column in watchlist:
@@ -362,6 +370,33 @@ def load_market_price_history(ticker: str) -> pd.DataFrame:
 
 
     return history
+
+
+def optional_display_text(value: object) -> str | None:
+    """Return a trimmed string, without treating a missing value as a value."""
+    if not isinstance(value, str):
+        return None
+
+    cleaned = " ".join(value.split())
+    return cleaned or None
+
+
+def prepare_market_display_frame(watchlist: pd.DataFrame) -> pd.DataFrame:
+    """Add safe company-name and sector labels from canonical security master data."""
+    frame = watchlist.copy()
+
+    if "security_name" not in frame:
+        frame["security_name"] = pd.NA
+    if "sector" not in frame:
+        frame["sector"] = pd.NA
+
+    frame["company_display"] = frame["security_name"].map(optional_display_text)
+    frame["company_display"] = frame["company_display"].fillna("Name unavailable")
+
+    frame["sector_display"] = frame["sector"].map(optional_display_text)
+    frame["sector_display"] = frame["sector_display"].fillna("Unclassified")
+
+    return frame
 
 
 def news_text(value: object) -> str | None:
@@ -981,9 +1016,7 @@ def build_fundamentals_explorer_frame(
 
 
 
-    frame = watchlist.copy()
-
-    frame["sector_display"] = frame["sector"].fillna("Unclassified")
+    frame = prepare_market_display_frame(watchlist)
 
     if hide_missing_metrics:
 
@@ -991,11 +1024,18 @@ def build_fundamentals_explorer_frame(
 
 
 
-    display_columns = ["ticker", "sector_display", *metric_columns]
+    display_columns = [
+        "ticker",
+        "company_display",
+        "sector_display",
+        *metric_columns,
+    ]
 
     rename_columns = {
 
         "ticker": "Ticker",
+
+        "company_display": "Company",
 
         "sector_display": "Sector",
 
@@ -2277,11 +2317,33 @@ def render_market_watchlist_dashboard() -> None:
 
 
 
+    display_frame = prepare_market_display_frame(watchlist)
+
+    reference_name_coverage = int(
+        (display_frame["company_display"] != "Name unavailable").sum()
+    )
+    reference_sector_coverage = int(
+        (display_frame["sector_display"] != "Unclassified").sum()
+    )
+    latest_reference_observed_at = (
+        display_frame["security_reference_observed_at"].max()
+        if "security_reference_observed_at" in display_frame
+        else None
+    )
+
+    if reference_name_coverage == len(display_frame) and reference_sector_coverage == len(display_frame):
+        st.caption(
+            "🏷️ Company names and broad sectors come from the canonical security-reference "
+            "data stored in Oracle. Reference reviewed: "
+            f"{timestamp_with_time_text(latest_reference_observed_at)}."
+        )
+    else:
+        st.warning(
+            "Some security-reference labels are unavailable. Missing company names and "
+            "sectors remain explicitly labeled as unavailable rather than guessed."
+        )
+
     filter_left, filter_right = st.columns(2)
-
-    display_frame = watchlist.copy()
-
-    display_frame["sector_display"] = display_frame["sector"].fillna("Unclassified")
 
     sectors = sorted(display_frame["sector_display"].unique().tolist())
 
@@ -2351,6 +2413,8 @@ def render_market_watchlist_dashboard() -> None:
 
             "ticker",
 
+            "company_display",
+
             "sector_display",
 
             "current_quote_price",
@@ -2378,6 +2442,8 @@ def render_market_watchlist_dashboard() -> None:
         columns={
 
             "ticker": "Ticker",
+
+            "company_display": "Company",
 
             "sector_display": "Sector",
 
@@ -2451,11 +2517,23 @@ def render_market_watchlist_dashboard() -> None:
 
     ticker_options = filtered["ticker"].tolist()
 
+    company_by_ticker = (
+        filtered.drop_duplicates(subset=["ticker"])
+        .set_index("ticker")["company_display"]
+        .to_dict()
+    )
+
     selected_ticker = st.selectbox(
 
         "Choose a ticker",
 
         options=ticker_options,
+
+        format_func=lambda ticker: (
+            ticker
+            if company_by_ticker.get(ticker) in (None, "Name unavailable")
+            else f"{ticker} — {company_by_ticker[ticker]}"
+        ),
 
         key="market_price_history_ticker",
 

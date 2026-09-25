@@ -172,3 +172,92 @@ or Streamlit Secret change is required.
 The displayed text is provider-supplied metadata. A missing summary remains
 missing; the dashboard must not generate or imply a summary. News is external
 research context, not investment advice.
+
+# Market security names and sector classifications
+
+This package adds a canonical security-reference layer for the existing
+44-security market watchlist.
+
+## What changes
+
+- `migrations/013_enrich_market_security_reference.sql`
+  - adds `security_name` and reference-provenance columns to `MK_SECURITY`;
+  - fills the current 44 securities with reviewed company names and broad,
+    consistent `Technology`, `Healthcare`, or `Energy` classifications;
+  - updates `VW_MK_WATCHLIST_ANALYSIS` to expose those values to the dashboard.
+- `app.py`
+  - shows **Company** next to **Ticker** in the current-quote table and the
+    Fundamentals Explorer;
+  - uses the canonical sector values for the sector filter;
+  - makes the historical-price selector read like `AAPL — Apple Inc.`.
+- `tests/test_market_security_reference.py`
+  - verifies the dashboard reads and labels canonical security-reference data.
+
+## Important design decision
+
+The dashboard does **not** make 44 yfinance calls whenever someone opens it.
+That would make the Streamlit app slower and less reliable. Instead, this is a
+reviewed, one-time reference seed stored in Oracle and labeled
+`CURATED_WATCHLIST_REFERENCE`. It does not pretend to be a live provider feed.
+A later provider-backed security-master ETL can refresh the same fields.
+
+## Browser-only deployment order
+
+1. In GitHub.dev, create `migrations/013_enrich_market_security_reference.sql`
+   and paste in the matching file from this package. Do not push the new
+   `app.py` yet.
+2. In Oracle Database Actions, open a worksheet while logged in as
+   `PORTFOLIO_APP`. Paste the entire migration and use **Run Script**. If that
+   option is unavailable, run the `ALTER TABLE`, `MERGE`, `CREATE OR REPLACE
+   VIEW`, and `COMMIT` statements in that order.
+3. Run these verification queries:
+
+```sql
+SELECT
+    COUNT(*) AS watchlist_securities,
+    COUNT(security_name) AS securities_with_name,
+    COUNT(sector) AS securities_with_sector,
+    COUNT(security_reference_payload_hash) AS securities_with_reference_hash
+FROM mk_security;
+
+SELECT sector, COUNT(*) AS security_count
+FROM mk_security
+GROUP BY sector
+ORDER BY sector;
+
+SELECT object_name, object_type, status
+FROM user_objects
+WHERE object_name = 'VW_MK_WATCHLIST_ANALYSIS';
+```
+
+Expected results: `44, 44, 44, 44`; sector counts of Energy `14`, Healthcare
+`15`, Technology `15`; and the view status `VALID`.
+
+4. Only after those checks pass, replace `app.py` and add
+   `tests/test_market_security_reference.py` in GitHub.dev.
+5. Commit and push with:
+
+```text
+feat: enrich market security reference data
+```
+
+6. Streamlit Community Cloud will rebuild automatically. Open the Market
+   Watchlist to confirm the Company column, populated sector filter, and named
+   ticker selector appear.
+
+If the dashboard reports that it cannot load market data after the view was
+recreated, verify the existing read-only grant as `PORTFOLIO_APP`:
+
+```sql
+SELECT grantee, privilege
+FROM all_tab_privs
+WHERE owner = 'PORTFOLIO_APP'
+  AND table_name = 'VW_MK_WATCHLIST_ANALYSIS'
+  AND grantee = 'PORTFOLIO_DASHBOARD';
+```
+
+Only if no row is returned, run:
+
+```sql
+GRANT SELECT ON vw_mk_watchlist_analysis TO portfolio_dashboard;
+```

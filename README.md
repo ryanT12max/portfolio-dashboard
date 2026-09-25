@@ -124,3 +124,51 @@ Add a dedicated rental-estimate enrichment pipeline before treating yield as bro
 Add data-quality monitoring for rejected records, late ETL runs, and null-rate changes.
 
 Add a separate stock holdings model and stock pipeline once personal holdings exist.
+
+# Market Watchlist News Feature
+
+This package adds a non-persistent Yahoo Finance news panel to the Market
+Watchlist. It preserves the supplied dashboard layout and uses the existing
+**Choose a ticker** selector.
+
+## What changes
+
+- Fetches at most three recent, linkable stories for the selected ticker using
+  `yfinance.Ticker(ticker).get_news()`.
+- Uses a 15-minute Streamlit cache so each viewer interaction does not create
+  an unnecessary provider request.
+- Shows title, publisher, publication time, provider snippet, and an external
+  **Read article** link.
+- Does not scrape article bodies, create an Oracle table, write database rows,
+  add a secret, or invent a summary when Yahoo does not supply one.
+- Filters out a story when Yahoo explicitly identifies it as related to other
+  tickers, rejects unsafe/non-web links, and handles multiple known yfinance
+  response shapes.
+- Keeps news available even when the selected ticker's historical-price query
+  is unavailable.
+
+## Browser-only installation
+
+1. Open `ryanT12max/portfolio-dashboard` on GitHub and press `.` to open
+   github.dev.
+2. Open the repository's existing `app.py`.
+3. Replace its contents with this package's `app.py`.
+4. Create `tests/test_market_news.py` from this package's test file.
+5. Review the source-control diff and commit with:
+
+   `feat: add selected-ticker market news panel`
+
+6. Streamlit Community Cloud will automatically deploy the GitHub commit.
+
+## Verification
+
+After the deployment finishes, open the **Market Watchlist** tab, choose a
+ticker, and scroll below the historical price chart. The panel should show up
+to three provider stories or a clear availability message. No Oracle migration
+or Streamlit Secret change is required.
+
+## Important data-labeling behavior
+
+The displayed text is provider-supplied metadata. A missing summary remains
+missing; the dashboard must not generate or imply a summary. News is external
+research context, not investment advice.

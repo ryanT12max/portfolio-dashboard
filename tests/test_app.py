@@ -106,7 +106,14 @@ def test_fundamentals_explorer_shows_all_stocks_in_a_compact_metric_group() -> N
     )
 
     assert list(explorer["Ticker"]) == ["AAA", "BBB", "CCC"]
-    assert list(explorer.columns) == ["Ticker", "Sector", "P/E ratio", "PEG ratio", "P/B ratio"]
+    assert list(explorer.columns) == [
+    "Ticker",
+    "Company",
+    "Sector",
+    "P/E ratio",
+    "PEG ratio",
+    "P/B ratio",
+    ]
     assert labels["pe_ratio"] == "P/E ratio"
 
 

@@ -787,7 +787,74 @@ FUNDAMENTAL_METRIC_GROUPS = {
 }
 
 
+# The score is deliberately a transparent *research comparison*, not a buy/sell
+# recommendation. It uses only metrics that can be compared meaningfully within
+# the broad sectors represented in this watchlist. Raw EPS and free-cash-flow
+# amounts stay visible in the Fundamentals Explorer, but are excluded here
+# because larger companies can naturally report larger dollar amounts.
+FUNDAMENTALS_RESEARCH_METRICS = (
+    (
+        "pe_ratio",
+        "lower",
+        0.15,
+        "💲 Priced lower than similar companies based on earnings.",
+        "💰 Investors are paying more for each dollar of earnings.",
+    ),
+    (
+        "peg_ratio",
+        "lower",
+        0.15,
+        "🌱 Price looks lower relative to expected growth.",
+        "💰 Price looks higher relative to expected growth.",
+    ),
+    (
+        "pb_ratio",
+        "lower",
+        0.10,
+        "🏷️ Price is lower compared with company book value.",
+        "🏷️ Price is higher compared with company book value.",
+    ),
+    (
+        "return_on_equity_pct",
+        "higher",
+        0.20,
+        "💪 Earns more profit from shareholder investment.",
+        "📉 Earns less profit from shareholder investment.",
+    ),
+    (
+        "profit_margin_pct",
+        "higher",
+        0.20,
+        "💪 Keeps more profit from each dollar of sales.",
+        "📉 Keeps less profit from each dollar of sales.",
+    ),
+    (
+        "debt_to_equity_ratio",
+        "lower",
+        0.20,
+        "🏦 Uses less debt compared with shareholder value.",
+        "⚠️ Uses more debt compared with shareholder value.",
+    ),
+)
 
+RESEARCH_SCORE_MIN_AVAILABLE_METRICS = 4
+RESEARCH_SCORE_MIN_SECTOR_PEERS = 4
+
+RESEARCH_SIGNAL_LABELS = {
+    "higher_priority": "🟢 Higher research priority",
+    "favorable": "🟢 Favorable",
+    "mixed": "🔵 Mixed",
+    "caution": "🔴 Caution",
+    "insufficient": "🔴 Insufficient data",
+}
+
+RESEARCH_SIGNAL_COLORS = {
+    RESEARCH_SIGNAL_LABELS["higher_priority"]: "#15803D",
+    RESEARCH_SIGNAL_LABELS["favorable"]: "#16A34A",
+    RESEARCH_SIGNAL_LABELS["mixed"]: "#1D4ED8",
+    RESEARCH_SIGNAL_LABELS["caution"]: "#B91C1C",
+    RESEARCH_SIGNAL_LABELS["insufficient"]: "#B91C1C",
+}
 
 
 def selected_property_key_from_rows(
@@ -1096,6 +1163,253 @@ def build_fundamentals_explorer_frame(
     )
 
     return display.rename(columns=rename_columns), metric_labels
+
+
+def _research_metric_values(
+    frame: pd.DataFrame,
+    metric_column: str,
+) -> pd.Series:
+    """Return a comparable numeric metric series without inventing missing values."""
+    values = pd.to_numeric(frame[metric_column], errors="coerce")
+
+    # Negative or zero valuation ratios are not comparable as ordinary valuation
+    # ratios. A negative debt-to-equity ratio generally reflects negative equity,
+    # which also needs separate research instead of a simplistic rank.
+    if metric_column in {"pe_ratio", "peg_ratio", "pb_ratio"}:
+        return values.where(values > 0)
+    if metric_column == "debt_to_equity_ratio":
+        return values.where(values >= 0)
+    return values
+
+
+def sector_relative_metric_score(
+    frame: pd.DataFrame,
+    metric_column: str,
+    direction: str,
+) -> pd.Series:
+    """Score one metric from 0 to 100 against available same-sector peers."""
+    values = _research_metric_values(frame, metric_column)
+    scores = pd.Series(float("nan"), index=frame.index, dtype="float64")
+
+    for _, sector_index in frame.groupby(
+        "sector_display",
+        dropna=False,
+        sort=False,
+    ).groups.items():
+        sector_values = values.loc[sector_index].dropna()
+        peer_count = len(sector_values)
+
+        if peer_count < RESEARCH_SCORE_MIN_SECTOR_PEERS:
+            continue
+
+        if sector_values.nunique() == 1:
+            scores.loc[sector_values.index] = 50.0
+            continue
+
+        rank = sector_values.rank(method="average", ascending=True)
+        if direction == "lower":
+            normalized_score = (peer_count - rank) / (peer_count - 1) * 100
+        else:
+            normalized_score = (rank - 1) / (peer_count - 1) * 100
+
+        scores.loc[sector_values.index] = normalized_score
+
+    return scores
+
+
+def research_signal_for_score(
+    score: float | None,
+    available_metric_count: int,
+) -> str:
+    """Return a deliberately non-prescriptive label for a research score."""
+    if available_metric_count < RESEARCH_SCORE_MIN_AVAILABLE_METRICS or pd.isna(score):
+        return RESEARCH_SIGNAL_LABELS["insufficient"]
+    if score >= 75:
+        return RESEARCH_SIGNAL_LABELS["higher_priority"]
+    if score >= 55:
+        return RESEARCH_SIGNAL_LABELS["favorable"]
+    if score >= 35:
+        return RESEARCH_SIGNAL_LABELS["mixed"]
+    return RESEARCH_SIGNAL_LABELS["caution"]
+
+
+def research_summary_text(
+    row: pd.Series,
+    score_columns: dict[str, str],
+) -> tuple[str, str]:
+    """Translate relative metric results into short, novice-friendly phrases."""
+    if row["research_signal"] == RESEARCH_SIGNAL_LABELS["insufficient"]:
+        return (
+            "Not enough comparable financial information yet.",
+            "More information is needed before comparing this stock.",
+        )
+
+    strengths: list[tuple[float, str]] = []
+    flags: list[tuple[float, str]] = []
+
+    for metric, _, _, strength_text, flag_text in FUNDAMENTALS_RESEARCH_METRICS:
+        metric_score = row.get(score_columns[metric])
+        if pd.isna(metric_score):
+            continue
+        if metric_score >= 70:
+            strengths.append((float(metric_score), strength_text))
+        elif metric_score <= 30:
+            flags.append((float(metric_score), flag_text))
+
+    strengths.sort(key=lambda item: item[0], reverse=True)
+    flags.sort(key=lambda item: item[0])
+
+    strengths_text = (
+        " ".join(text for _, text in strengths[:2])
+        if strengths
+        else "No clear stand-out strengths in this comparison."
+    )
+    flags_text = (
+        " ".join(text for _, text in flags[:2])
+        if flags
+        else "No major research flags from these available metrics."
+    )
+    return strengths_text, flags_text
+
+
+def build_fundamentals_research_score_frame(
+    watchlist: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build an explainable, sector-relative fundamentals research comparison."""
+    frame = prepare_market_display_frame(watchlist)
+
+    for metric, _, _, _, _ in FUNDAMENTALS_RESEARCH_METRICS:
+        if metric not in frame:
+            frame[metric] = pd.NA
+
+    score_columns: dict[str, str] = {}
+    weighted_total = pd.Series(0.0, index=frame.index, dtype="float64")
+    available_weight = pd.Series(0.0, index=frame.index, dtype="float64")
+    available_metric_count = pd.Series(0, index=frame.index, dtype="int64")
+
+    for metric, direction, weight, _, _ in FUNDAMENTALS_RESEARCH_METRICS:
+        score_column = f"_{metric}_research_score"
+        score_columns[metric] = score_column
+        frame[score_column] = sector_relative_metric_score(frame, metric, direction)
+
+        is_available = frame[score_column].notna()
+        weighted_total = weighted_total.add(frame[score_column].fillna(0) * weight)
+        available_weight = available_weight.add(is_available.astype(float) * weight)
+        available_metric_count = available_metric_count.add(is_available.astype(int))
+
+    frame["research_score"] = weighted_total.div(
+        available_weight.where(available_weight > 0)
+    )
+    frame["research_metric_count"] = available_metric_count
+    frame.loc[
+        frame["research_metric_count"] < RESEARCH_SCORE_MIN_AVAILABLE_METRICS,
+        "research_score",
+    ] = float("nan")
+    frame["research_signal"] = [
+        research_signal_for_score(score, metric_count)
+        for score, metric_count in zip(
+            frame["research_score"],
+            frame["research_metric_count"],
+            strict=True,
+        )
+    ]
+
+    summaries = frame.apply(
+        research_summary_text,
+        axis=1,
+        score_columns=score_columns,
+        result_type="expand",
+    )
+    frame[["research_strengths", "research_flags"]] = summaries
+
+    display = frame[
+        [
+            "ticker",
+            "company_display",
+            "sector_display",
+            "research_score",
+            "research_signal",
+            "research_strengths",
+            "research_flags",
+        ]
+    ].rename(
+        columns={
+            "ticker": "Ticker",
+            "company_display": "Company",
+            "sector_display": "Sector",
+            "research_score": "Research score",
+            "research_signal": "Signal",
+            "research_strengths": "Simple strengths",
+            "research_flags": "Simple research flags",
+        }
+    )
+
+    return display.sort_values(
+        by=["Research score", "Ticker"],
+        ascending=[False, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+def research_signal_css(signal: object) -> str:
+    """Return the accessible background style for one displayed Signal value."""
+    color = RESEARCH_SIGNAL_COLORS.get(signal, "")
+    if not color:
+        return ""
+    return f"background-color: {color}; color: white; font-weight: 700;"
+
+
+def style_fundamentals_research_score(
+    score_frame: pd.DataFrame,
+) -> pd.io.formats.style.Styler:
+    """Color only the Signal cell while keeping the comparison table readable."""
+    def style_row(row: pd.Series) -> list[str]:
+        return [
+            research_signal_css(row["Signal"]) if column == "Signal" else ""
+            for column in row.index
+        ]
+
+    return score_frame.style.apply(style_row, axis=1)
+
+
+def render_fundamentals_research_score(watchlist: pd.DataFrame) -> None:
+    """Render a readable, sector-relative research-score table."""
+    st.subheader("🧭 Fundamentals Research Score")
+    st.caption(
+        "A sector-relative research comparison—not a buy or sell recommendation. "
+        "It uses valuation (40%), profitability (40%), and debt level (20%). "
+        "Unknown values are never treated as zero."
+    )
+
+    score_frame = build_fundamentals_research_score_frame(watchlist)
+    if score_frame.empty:
+        st.info("No securities are available for a fundamentals research comparison.")
+        return
+
+    st.dataframe(
+        style_fundamentals_research_score(score_frame).format(
+            {"Research score": "{:.0f}"},
+            na_rep="—",
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.caption(
+        "🟢 Green means stronger available fundamentals for further research. "
+        "🔵 Blue means mixed results. 🔴 Red means either notable caution signals "
+        "or insufficient information; insufficient data is unknown, not automatically bad."
+    )
+    with st.expander("How this score works"):
+        st.markdown(
+            """
+            - Each stock is compared only with the displayed stocks in the same broad sector.
+            - Lower P/E, PEG, P/B, and debt-to-equity can improve the comparison score.
+            - Higher return on equity and profit margin can improve the comparison score.
+            - EPS and free cash flow remain in the Fundamentals Explorer, but are not scored because
+              raw dollar amounts are not directly comparable between differently sized companies.
+            - The score does not predict returns or replace reading company filings, news, and risks.
+            """
+        )
 
 
 
@@ -2508,6 +2822,8 @@ def render_market_watchlist_dashboard() -> None:
     )
 
 
+
+    render_fundamentals_research_score(filtered)
 
     render_fundamentals_explorer(filtered)
 

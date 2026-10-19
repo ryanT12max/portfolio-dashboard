@@ -36,6 +36,10 @@ class QualitySummary:
     rent_estimate_count: int
     rent_estimate_missing_count: int
     duplicate_rent_estimate_groups: int
+    property_scope_rent_estimate_count: int = 0
+    unit_scope_rent_estimate_count: int = 0
+    rent_estimate_unavailable_count: int = 0
+    rent_estimate_retry_pending_count: int = 0
 
     @property
     def rent_estimate_coverage_pct(self) -> float | None:

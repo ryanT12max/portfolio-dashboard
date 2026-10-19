@@ -52,16 +52,40 @@ QUALITY_SUMMARY_SQL = """
         ) AS incomplete_core_attributes,
         SUM(
             CASE
-                WHEN rent_estimate_status = 'ESTIMATED' THEN 1
-                ELSE 0
-            END
+            WHEN rent_estimate_status IN ('ESTIMATED_PROPERTY', 'ESTIMATED_UNIT') THEN 1
+            ELSE 0
+        END
         ) AS rent_estimate_count,
         SUM(
             CASE
-                WHEN rent_estimate_status = 'MISSING' THEN 1
+                WHEN rent_estimate_status IN ('MISSING', 'RETRY_PENDING', 'UNAVAILABLE') THEN 1
+            ELSE 0
+        END
+        ) AS rent_estimate_missing_count,
+        SUM(
+            CASE
+                WHEN rent_estimate_status = 'ESTIMATED_PROPERTY' THEN 1
                 ELSE 0
             END
-        ) AS rent_estimate_missing_count
+        ) AS property_scope_rent_estimate_count,
+        SUM(
+            CASE
+                WHEN rent_estimate_status = 'ESTIMATED_UNIT' THEN 1
+                ELSE 0
+            END
+        ) AS unit_scope_rent_estimate_count,
+        SUM(
+            CASE
+                WHEN rent_estimate_status = 'UNAVAILABLE' THEN 1
+                ELSE 0
+            END
+        ) AS rent_estimate_unavailable_count,
+        SUM(
+            CASE
+                WHEN rent_estimate_status = 'RETRY_PENDING' THEN 1
+                ELSE 0
+            END
+        ) AS rent_estimate_retry_pending_count
     FROM vw_re_current_investment_analysis
     WHERE listing_status = 'Active' OR listing_status IS NULL
 """
@@ -129,6 +153,18 @@ def fetch_quality_summary(cursor: oracledb.Cursor) -> QualitySummary:
         duplicate_rent_estimate_groups=_as_int(
             duplicate_row["duplicate_rent_estimate_groups"]
         ),
+        property_scope_rent_estimate_count=_as_int(
+            summary_row["property_scope_rent_estimate_count"]
+        ),
+        unit_scope_rent_estimate_count=_as_int(
+            summary_row["unit_scope_rent_estimate_count"]
+        ),
+        rent_estimate_unavailable_count=_as_int(
+            summary_row["rent_estimate_unavailable_count"]
+        ),
+        rent_estimate_retry_pending_count=_as_int(
+            summary_row["rent_estimate_retry_pending_count"]
+        ),
     )
 
 
@@ -167,6 +203,16 @@ def print_report(
         "Rent-estimate coverage: "
         f"{summary.rent_estimate_count:,}/{summary.total_current_listings:,} "
         f"({summary.rent_estimate_coverage_pct or 0:.2f}%)"
+    )
+    print(
+        "Rent-estimate scope: "
+        f"{summary.property_scope_rent_estimate_count:,} whole-property, "
+        f"{summary.unit_scope_rent_estimate_count:,} single-unit"
+    )
+    print(
+        "Rent-estimate outcomes without a value: "
+        f"{summary.rent_estimate_unavailable_count:,} unavailable, "
+        f"{summary.rent_estimate_retry_pending_count:,} retry pending"
     )
     print(
         "Invalid asking prices: "

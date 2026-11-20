@@ -2645,20 +2645,6 @@ def render_market_watchlist_dashboard() -> None:
 
         )
 
-    else:
-
-        st.success(
-
-            f"Current quote coverage is complete: {securities_with_current_quotes} of "
-
-            f"{len(watchlist)} securities. The oldest quote snapshot is "
-
-            f"{quote_age_hours:.1f} hours old."
-
-        )
-
-
-
     st.caption(
 
         "Current quote observation timestamps range from "
@@ -2703,18 +2689,6 @@ def render_market_watchlist_dashboard() -> None:
 
         )
 
-    else:
-
-        st.info(
-
-            f"The oldest latest stored market price is {price_age_days} calendar day(s) old. "
-
-            "They are historical reference data, not real-time quotes."
-
-        )
-
-
-
     if fundamentals_coverage < 25:
 
         st.warning(
@@ -2724,19 +2698,6 @@ def render_market_watchlist_dashboard() -> None:
             "fundamentals. Missing values are unknown; they are not zero or unfavorable values."
 
         )
-
-
-
-    if (watchlist["fundamentals_status"] == "AVAILABLE_AS_OF_UNKNOWN").any():
-
-        st.warning(
-
-            "Available fundamentals do not have a verified provider as-of date. Treat them "
-
-            "as legacy historical context rather than current company financials."
-
-        )
-
 
 
     render_metric_dictionary()

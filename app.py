@@ -16,19 +16,22 @@ from __future__ import annotations
 
 
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any
 
 
 
 import pandas as pd
 
+import requests
+
 import streamlit as st
 import yfinance as yf
 
 
 
-from portfolio_dashboard.config import ConfigurationError
+from portfolio_dashboard.config import ConfigurationError, get_settings
 
 from portfolio_dashboard.database import managed_connection
 
@@ -252,6 +255,12 @@ NEWS_DISPLAY_LIMIT = 3
 NEWS_FETCH_LIMIT = 10
 NEWS_CACHE_TTL_SECONDS = 15 * 60
 NEWS_SUMMARY_MAX_CHARACTERS = 500
+FINNHUB_COMPANY_NEWS_URL = "https://finnhub.io/api/v1/company-news"
+NEWS_LOOKBACK_DAYS = 14
+NEWS_REQUEST_TIMEOUT_SECONDS = 15
+
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -420,7 +429,7 @@ def news_url(value: object) -> str | None:
 
 
 def news_timestamp(value: object) -> pd.Timestamp | None:
-    """Normalize Yahoo's epoch or ISO timestamp without guessing a date."""
+    """Normalize a provider epoch or ISO timestamp without guessing a date."""
     if value is None:
         return None
 
@@ -523,22 +532,101 @@ def normalize_yfinance_news_item(
         ),
         "published_at": published_at,
         "sort_timestamp": timestamp.timestamp() if timestamp is not None else 0.0,
+        "data_source": "Yahoo Finance via yfinance",
     }
 
 
-@st.cache_data(ttl=NEWS_CACHE_TTL_SECONDS, show_spinner=False)
-def load_ticker_news(ticker: str) -> tuple[list[dict[str, Any]], str | None]:
-    """Fetch up to three recent, linkable provider stories for one selected ticker."""
+def normalize_finnhub_news_item(item: object) -> dict[str, Any] | None:
+    """Normalize a Finnhub Company News story into the dashboard card shape."""
+    if not isinstance(item, dict):
+        return None
+
+    title = news_text(item.get("headline"))
+    url = news_url(item.get("url"))
+    if not title or not url:
+        return None
+
+    summary = news_text(item.get("summary"))
+    published_at = item.get("datetime")
+    timestamp = news_timestamp(published_at)
+
+    return {
+        "title": title,
+        "url": url,
+        "summary": summary,
+        "publisher": news_text(item.get("source")) or "Publisher unavailable",
+        "published_at": published_at,
+        "sort_timestamp": timestamp.timestamp() if timestamp is not None else 0.0,
+        "data_source": "Finnhub",
+    }
+
+
+def fetch_finnhub_news(ticker: str) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch and normalize recent Finnhub stories without exposing the API key."""
+    api_key = get_settings().finnhub_api_key
+    if not api_key:
+        logger.warning("Finnhub news skipped because FINNHUB_API_KEY is not configured.")
+        return [], False
+
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=NEWS_LOOKBACK_DAYS)
+
+    try:
+        response = requests.get(
+            FINNHUB_COMPANY_NEWS_URL,
+            params={
+                "symbol": ticker.upper(),
+                "from": start_date.isoformat(),
+                "to": end_date.isoformat(),
+                "token": api_key,
+            },
+            headers={"accept": "application/json"},
+            timeout=NEWS_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        raw_items = response.json()
+    except (requests.RequestException, ValueError) as error:
+        # Log only the exception type so a request URL or token is never exposed.
+        logger.warning(
+            "Finnhub news request failed for ticker=%s (%s).",
+            ticker.upper(),
+            type(error).__name__,
+        )
+        return [], False
+
+    if not isinstance(raw_items, list):
+        logger.warning(
+            "Finnhub news returned an unexpected response shape for ticker=%s.",
+            ticker.upper(),
+        )
+        return [], False
+
+    stories = [
+        story
+        for item in raw_items
+        if (story := normalize_finnhub_news_item(item)) is not None
+    ]
+    stories.sort(key=lambda story: float(story["sort_timestamp"]), reverse=True)
+    return stories[:NEWS_DISPLAY_LIMIT], True
+
+
+def fetch_yfinance_news(ticker: str) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch Yahoo Finance stories only when the primary Finnhub source has none."""
     try:
         raw_items = yf.Ticker(ticker).get_news(
             count=NEWS_FETCH_LIMIT,
             tab="news",
         )
-    except Exception:
-        return [], "The news provider is temporarily unavailable. Please try again later."
+    except Exception as error:
+        logger.warning(
+            "Yahoo Finance news request failed for ticker=%s (%s).",
+            ticker.upper(),
+            type(error).__name__,
+        )
+        return [], False
 
     if not isinstance(raw_items, list):
-        return [], None
+        return [], False
 
     stories = [
         story
@@ -546,15 +634,37 @@ def load_ticker_news(ticker: str) -> tuple[list[dict[str, Any]], str | None]:
         if (story := normalize_yfinance_news_item(item, ticker)) is not None
     ]
     stories.sort(key=lambda story: float(story["sort_timestamp"]), reverse=True)
-    return stories[:NEWS_DISPLAY_LIMIT], None
+    return stories[:NEWS_DISPLAY_LIMIT], True
+
+
+@st.cache_data(ttl=NEWS_CACHE_TTL_SECONDS, show_spinner=False)
+def load_ticker_news(ticker: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch recent news from Finnhub, with Yahoo Finance as a non-critical fallback."""
+    normalized_ticker = ticker.upper().strip()
+    if not normalized_ticker:
+        return [], "Choose a valid ticker to load company news."
+
+    finnhub_stories, finnhub_responded = fetch_finnhub_news(normalized_ticker)
+    if finnhub_stories:
+        return finnhub_stories, None
+
+    yfinance_stories, yfinance_responded = fetch_yfinance_news(normalized_ticker)
+    if yfinance_stories:
+        return yfinance_stories, None
+
+    if not finnhub_responded and not yfinance_responded:
+        return [], "News providers are temporarily unavailable. Please try again later."
+
+    return [], None
 
 
 def render_market_news(ticker: str) -> None:
     """Render provider news as a non-persistent research aid for one ticker."""
     st.subheader(f"📰 Latest news for {ticker}")
     st.caption(
-        "Up to three recent Yahoo Finance stories retrieved through yfinance. "
-        "Summaries are provider-supplied snippets; links open the original publisher article."
+        "Up to three recent stories from Finnhub, with Yahoo Finance used only as a "
+        "fallback. Summaries are provider-supplied snippets; links open the original "
+        "publisher article."
     )
 
     stories, provider_error = load_ticker_news(ticker)
@@ -568,8 +678,10 @@ def render_market_news(ticker: str) -> None:
     for story in stories:
         with st.container(border=True):
             st.markdown(f"**{story['title']}**")
+            data_source = news_text(story.get("data_source")) or "News provider"
             st.caption(
-                f"{story['publisher']} • {news_timestamp_text(story['published_at'])}"
+                f"{story['publisher']} • {news_timestamp_text(story['published_at'])} "
+                f"• via {data_source}"
             )
 
             summary = story["summary"]
